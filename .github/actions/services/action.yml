@@ -1,0 +1,9 @@
+name: Setup services
+description: Start test services
+
+runs:
+  using: composite
+  steps:
+    - name: Setup services
+      shell: bash
+      run: uv run --no-sync python ci/prepare.py

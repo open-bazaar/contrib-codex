@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.bcn-ci/
+.cache/
+.artifacts/
+dist/
+/scripts
+node_modules/
+

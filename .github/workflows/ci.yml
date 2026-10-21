@@ -1,0 +1,110 @@
+name: Codex CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout BCN
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yuchanns/bazaar-compute-node
+          ref: b1ef183953f146ace34cd6438388b68855eb0041
+          path: .bcn-ci
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Setup scripts
+        run: ln -s .bcn-ci/scripts scripts
+
+      - name: Setup Python
+        uses: yuchanns/bazaar-compute-node/.github/actions/setup@b1ef183953f146ace34cd6438388b68855eb0041
+
+      - name: Lint
+        uses: yuchanns/bazaar-compute-node/.github/actions/checks@b1ef183953f146ace34cd6438388b68855eb0041
+        with:
+          packages: bazaar-contrib-codex
+
+      - name: Build
+        run: uv run --no-sync scripts/ci.py package --package bazaar-contrib-codex
+
+  test:
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: yuchanns/bazaar-compute-node/.github/actions/setup@b1ef183953f146ace34cd6438388b68855eb0041
+
+      - name: Setup Codex
+        run: |
+          set -o pipefail
+          npm install --prefix "$RUNNER_TEMP/codex" --no-audit --no-fund --package-lock=false @openai/codex@latest
+          echo "$RUNNER_TEMP/codex/node_modules/.bin" >> "$GITHUB_PATH"
+          mkdir -p .artifacts
+          "$RUNNER_TEMP/codex/node_modules/.bin/codex" --version | tee .artifacts/codex-version.txt
+
+      - name: Setup sandbox
+        run: |
+          set -o pipefail
+          sysctl kernel.apparmor_restrict_unprivileged_userns | tee .artifacts/sandbox.log
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 | tee -a .artifacts/sandbox.log
+          mkdir -p "$RUNNER_TEMP/codex-probe"
+          CODEX_HOME="$RUNNER_TEMP/codex-probe" "$RUNNER_TEMP/codex/node_modules/.bin/codex" sandbox \
+            -c 'sandbox_mode="workspace-write"' \
+            -c sandbox_workspace_write.network_access=true \
+            -- /bin/pwd 2>&1 | tee -a .artifacts/sandbox.log
+
+      - name: Cache model
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .cache/models
+          key: gemma-${{ hashFiles('ci/model.json') }}
+
+      - name: Setup services
+        uses: ./.github/actions/services
+
+      - name: Test
+        run: |
+          mkdir -p .artifacts
+          touch .artifacts/codex.jsonl .artifacts/codex.stderr
+          docker compose -f .github/services/compose.yml logs --no-color --follow model &
+          model_log_pid=$!
+          tail -n +1 -F .artifacts/codex.jsonl .artifacts/codex.stderr &
+          codex_log_pid=$!
+          trap 'kill "$model_log_pid" "$codex_log_pid" 2>/dev/null || true' EXIT
+          uv run --no-sync pytest -m e2e -v --junitxml=.artifacts/results.xml
+
+      - name: Cleanup
+        if: always()
+        run: uv run --no-sync python ci/cleanup.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: test-results
+          path: .artifacts/
+          include-hidden-files: true
+          if-no-files-found: warn

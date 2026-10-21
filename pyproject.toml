@@ -1,0 +1,44 @@
+[project]
+name = "bazaar-contrib-codex"
+version = "0.3.0rc1"
+description = "Codex harness provider for Bazaar Compute Node"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.15"
+
+[project.urls]
+Repository = "https://github.com/open-bazaar/contrib-codex"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "blockbuster>=1.5.29,<1.6",
+    "httpx>=0.28.1",
+    "packaging>=25.0",
+    "pydantic>=2.12.0",
+    "pyright==1.1.414",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Codex refuses helper aliases when CODEX_HOME is under the system temp directory.
+addopts = "-p no:anyio --basetemp=.cache/pytest"
+markers = ["e2e: uses isolated real model, Magpie and Codex processes"]
+
+[tool.pyright]
+include = ["src", "ci", "tests"]
+pythonVersion = "3.15"
+pythonPlatform = "All"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
+
+[tool.ruff.lint]
+extend-select = ["ASYNC", "I"]

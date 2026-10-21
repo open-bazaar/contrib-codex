@@ -1,0 +1,80 @@
+services:
+  model:
+    # llama.cpp CPU server, fixed multi-platform manifest.
+    image: ghcr.io/ggml-org/llama.cpp@sha256:9fbaa06d7f4449e2ae0d02b40e0431f7c212dcf231c9e3a7777a6afc2cc8f312
+    cpus: 4
+    mem_limit: 10g
+    ports:
+      - "127.0.0.1:0:8080"
+    volumes:
+      - ${MODEL_DIR:?MODEL_DIR is required}:/models:ro
+    command:
+      - --model
+      - /models/gemma-4-E4B_q4_0-it.gguf
+      - --alias
+      - gemma-4-e4b
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --threads
+      - "4"
+      - --ctx-size
+      - "32768"
+      - --parallel
+      - "1"
+      - --temp
+      - "0"
+      - --seed
+      - "42"
+      - --n-gpu-layers
+      - "0"
+      - --jinja
+      - --chat-template-kwargs
+      - '{"enable_thinking":false}'
+      - --reasoning-budget
+      - "0"
+      - --no-webui
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8080/health]
+      interval: 5s
+      start_period: 5m
+      retries: 12
+
+  magpie:
+    # Magpie v0.1.1305.
+    image: ghcr.io/yetone/magpie@sha256:9febe18ffd2f0fb7b59e9dad6d7653e927276e11fc35b33ab490a0bf44f495e0
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:0:3425"
+    environment:
+      MAGPIE_ADDR: 0.0.0.0:3425
+    volumes:
+      - magpie:/config
+    depends_on:
+      model:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, magpie, healthcheck]
+      interval: 5s
+      retries: 12
+
+  postgres:
+    image: postgres:17.6-bookworm@sha256:f3bd19c606e442c3d7bdfa8002e03fe260a1023351e0ea4598032022b68dd6e3
+    mem_limit: 512m
+    ports:
+      - "127.0.0.1:0:5432"
+    environment:
+      POSTGRES_USER: codex
+      POSTGRES_PASSWORD: local-ci-only
+      POSTGRES_DB: codex
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, codex, -d, codex]
+      interval: 5s
+      retries: 12
+
+volumes:
+  magpie:
+  postgres:
