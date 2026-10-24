@@ -1,0 +1,312 @@
+"""Own a Codex JSON-lines process and route requests independently of output."""
+
+# All request and shutdown budgets are supplied by the owning Harness call.
+# ruff: noqa: ASYNC109
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import subprocess
+from collections.abc import Awaitable, Callable
+from importlib.metadata import version
+from pathlib import Path
+from typing import Any
+
+import psutil
+from bazaar_contrib_harness import HarnessFailure, HarnessFailureReason
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+logger = logging.getLogger(__name__)
+
+
+class Packet(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: int | str | None = None
+    method: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: dict[str, Any] | None = None
+
+
+class AppServerError(RuntimeError):
+    """A native request failure or a protocol/state error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: HarnessFailureReason = HarnessFailureReason.EXECUTION,
+        code: int | str | None = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.code = code
+
+
+class AppServerUnavailable(AppServerError):
+    """The transport cannot confirm what the provider last executed."""
+
+
+def failure(error: BaseException, *, needs_reconciliation: bool) -> HarnessFailure:
+    """Preserve error facts separately from the owning call's recovery policy."""
+
+    if isinstance(error, (AppServerUnavailable, ConnectionError)):
+        reason = HarnessFailureReason.CONNECTION_LOST
+    elif isinstance(error, AppServerError):
+        reason = error.reason
+    elif isinstance(error, TimeoutError):
+        reason = HarnessFailureReason.TIMEOUT
+    elif isinstance(error, OSError):
+        reason = HarnessFailureReason.UNAVAILABLE
+    else:
+        reason = HarnessFailureReason.INTERNAL
+    return HarnessFailure(
+        reason,
+        str(error) or type(error).__name__,
+        needs_reconciliation=needs_reconciliation,
+        code=error.code
+        if isinstance(error, AppServerError)
+        else error.errno
+        if isinstance(error, OSError)
+        else None,
+    )
+
+
+class AppServer:
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        handler: Callable[[Packet], Awaitable[dict[str, Any]]],
+        notify: Callable[[Packet], None],
+    ):
+        self.process = process
+        self.handler = handler
+        self.notify = notify
+        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.requests: dict[int | str, asyncio.Task[None]] = {}
+        self.events: asyncio.Queue[Packet | Exception] = asyncio.Queue()
+        self.sequence = 0
+        self.writing = asyncio.Lock()
+        self.reader = asyncio.create_task(self.read())
+        self.errors = asyncio.create_task(self.read_errors())
+
+    @classmethod
+    async def start(
+        cls,
+        workspace: Path,
+        environment: dict[str, str],
+        handler: Callable[[Packet], Awaitable[dict[str, Any]]],
+        notify: Callable[[Packet], None],
+    ) -> AppServer:
+        process = await asyncio.create_subprocess_exec(
+            "codex",
+            "app-server",
+            "--listen",
+            "stdio://",
+            cwd=workspace,
+            env=os.environ | environment,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
+        return cls(process, handler, notify)
+
+    async def initialize(self, *, timeout: float) -> dict[str, Any]:
+        result = await self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "bazaar_contrib_codex",
+                    "version": version("bazaar-contrib-codex"),
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+            timeout=timeout,
+        )
+        await self.write({"method": "initialized"})
+        return result
+
+    async def write(self, packet: dict[str, Any]):
+        stdin = self.process.stdin
+        if stdin is None or stdin.is_closing() or self.process.returncode is not None:
+            raise AppServerUnavailable("Codex app-server is no longer running")
+        async with self.writing:
+            stdin.write(json.dumps(packet).encode() + b"\n")
+            await stdin.drain()
+
+    async def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        self.sequence += 1
+        id = self.sequence
+        future = asyncio.get_running_loop().create_future()
+        self.pending[id] = future
+        try:
+            async with asyncio.timeout(timeout):
+                await self.write({"id": id, "method": method, "params": params})
+                return await future
+        except TimeoutError as error:
+            raise TimeoutError(
+                f"Codex {method} timed out after {timeout:g} seconds"
+            ) from error
+        finally:
+            self.pending.pop(id, None)
+
+    async def answer(self, packet: Packet):
+        try:
+            result = await self.handler(packet)
+            await self.write({"id": packet.id, "result": result})
+        except Exception:
+            logger.exception(
+                "Could not send the response to Codex request %s", packet.id
+            )
+        finally:
+            if packet.id is not None:
+                self.requests.pop(packet.id, None)
+
+    async def read(self):
+        stdout = self.process.stdout
+        assert stdout is not None
+        buffer = bytearray()
+        try:
+            while chunk := await stdout.read(64 * 1024):
+                buffer.extend(chunk)
+                while (index := buffer.find(b"\n")) >= 0:
+                    line = bytes(buffer[:index])
+                    del buffer[: index + 1]
+                    if not line.strip():
+                        continue
+                    packet = Packet.model_validate_json(line)
+                    if packet.method is not None:
+                        self.notify(packet)
+                        self.events.put_nowait(packet)
+                        if packet.id is not None:
+                            self.requests[packet.id] = asyncio.create_task(
+                                self.answer(packet)
+                            )
+                        else:
+                            if packet.method == "serverRequest/resolved":
+                                task = self.requests.pop(
+                                    packet.params["requestId"], None
+                                )
+                                if task is not None:
+                                    task.cancel()
+                    elif isinstance(packet.id, int):
+                        future = self.pending.get(packet.id)
+                        if future is not None and not future.done():
+                            if packet.error is not None:
+                                future.set_exception(
+                                    AppServerError(
+                                        str(
+                                            packet.error.get(
+                                                "message", "Codex request failed"
+                                            )
+                                        ),
+                                        code=packet.error.get("code"),
+                                    )
+                                )
+                            else:
+                                future.set_result(packet.result)
+            await self.process.wait()
+            raise AppServerUnavailable(
+                f"Codex app-server exited ({self.process.returncode})",
+                code=self.process.returncode,
+            )
+        except Exception as error:  # noqa: BLE001 -- Isolate provider protocol failures.
+            if isinstance(error, ValidationError):
+                error = AppServerError(str(error), reason=HarnessFailureReason.PROTOCOL)
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(error)
+            self.events.put_nowait(error)
+
+    async def read_errors(self):
+        stderr = self.process.stderr
+        assert stderr is not None
+        while chunk := await stderr.read(64 * 1024):
+            for line in chunk.decode(errors="replace").splitlines():
+                logger.debug("Codex app-server stderr: %s", line)
+
+    async def aclose(self, *, timeout: float):
+        deadline = asyncio.get_running_loop().time() + timeout
+        tasks = tuple(self.requests.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.requests.clear()
+        children: list[psutil.Process] = []
+        try:
+            children = await asyncio.to_thread(
+                psutil.Process(self.process.pid).children, recursive=True
+            )
+        except psutil.NoSuchProcess:
+            pass
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        try:
+            for fraction, operation in ((0.6, None), (0.2, "terminate"), (0.1, "kill")):
+                if self.process.returncode is not None:
+                    break
+                if operation is not None:
+                    if os.name != "nt":
+                        try:
+                            os.killpg(
+                                self.process.pid,
+                                signal.SIGTERM
+                                if operation == "terminate"
+                                else signal.SIGKILL,
+                            )
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        for child in reversed(children):
+                            try:
+                                getattr(child, operation)()
+                            except psutil.NoSuchProcess:
+                                pass
+                        if self.process.returncode is None:
+                            getattr(self.process, operation)()
+                try:
+                    async with asyncio.timeout(timeout * fraction):
+                        await self.process.wait()
+                    break
+                except TimeoutError:
+                    continue
+            # A background tool can retain a pipe after the app-server exits.
+            # The process group was created by this transport and belongs to it.
+            if os.name != "nt":
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for child in reversed(children):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            await asyncio.to_thread(
+                psutil.wait_procs,
+                children,
+                timeout=max(0, deadline - asyncio.get_running_loop().time()),
+            )
+            async with asyncio.timeout(
+                max(0, deadline - asyncio.get_running_loop().time())
+            ):
+                await self.process.wait()
+                await asyncio.gather(self.reader, self.errors, return_exceptions=True)
+        except TimeoutError:
+            logger.warning("Codex cleanup reached the caller's shutdown budget")
+        finally:
+            self.reader.cancel()
+            self.errors.cancel()
+            await asyncio.gather(self.reader, self.errors, return_exceptions=True)
