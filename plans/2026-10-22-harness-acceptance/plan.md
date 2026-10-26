@@ -2,6 +2,60 @@
 
 ## Task 2：0.2 行为对齐与已合并宿主契约（2026-10-25）
 
+### 入口统一预算和后台清理修订（2026-10-26）
+
+开发线程 `b4caa994-9697-55b8-8a30-403e8252dab4` 授权按已讨论方案修改，
+`ecfcff3f-e9c2-573d-8bec-ea500c4211f0` 要求一并处理同类调用。
+本修订接替下节 RC7 初版的分阶段计时及同步等待取消清理：
+
+- 现有查询调用方直接接受 TIMER 和已注册的 Codex Builder，外层公共 timeout 约束整次 inspect。
+  Builder／配置类及其公开签名保持现有形态，查询内部不重复建立阶段预算。
+- 会话启动、turn/start、steering、恢复和后台状态查询由各自入口统一计时；
+  初始化、文件监视、请求排队、写入、分页与重试服从入口取消，底层 transport 只做 I/O。
+- AppServer.close 创建并复用有强引用和异常记录的后台任务。查询与失败路径只安排清理，
+  aclose 的等待被取消时直接传播取消；清理继续执行自己的有界关闭和强制回收。
+  正常插件退出并行等待所属清理任务，旧连接关闭后停止向宿主投递通知。
+- TestChannel 在真实节点已有的插件组合中执行注册查询，保留 inspection.json；
+  八项安装态业务沿用 PyPI rc7 公共 SDK 和固定 Codex 0.164.0。
+  用真实暂停进程观察前台超时返回、后台清理及随后查询成功，静态检查、构建和 CI 结果回填本节。
+
+本轮在既有 PR2 的基线上新增独立签名提交供 review。
+
+本地验证：Ruff、16 个文件的格式、Pyright CLI、根目录 LSP 及 provider／TestChannel
+四个 wheel／sdist 构建通过。全新隔离安装使用 PyPI rc7，真实节点在已有组合中完成
+注册 Builder 查询并返回 Codex 0.164.0 的 8 个模型；节点退出 0，无遗留自有进程。
+实际暂停所属 Codex 进程后，500ms 查询约 499ms 返回 TimeoutError，外部取消正常传播，
+会话启动约 501ms 返回 timeout 失败；返回时进程仍暂停、后台清理仍运行，随后完成回收。
+同一查询方的后续查询成功，最终自有存活进程为空。这些诊断没有模型回合。
+补充实际 aclose 取消观察：注入 TIMER 与独立路径均立即传播调用者取消，后台清理继续执行，
+最终强制回收暂停的进程；没有同步等待清理结束才向前台抛出取消。
+
+[CI 40329022427](https://github.com/open-bazaar/contrib-codex/actions/runs/40329022427)
+在本轮实现提交 `0427b5b6865905414cb33a451c90b6d38c9d9e70` 上全部四项作业成功。
+Linux／macOS／Windows 静态检查、类型和构建通过；真实安装态 BCN／TestChannel
+业务验收 **8 passed（1537.56 秒，25 分 37 秒）**。四份完整作业日志均确认 12 个
+PyPI rc7 SDK，实际 checkout 合并树与该实现提交一致，固定 CLI 为 Codex 0.164.0。
+
+十次节点启动均通过已有组合内的注册 Builder 查询，返回 8 个模型且没有错误；
+十个隔离节点全部退出 0，即时检查的自有子进程和进程明细均为空。
+MCP ONCE、SESSION 复用和跨会话 ALWAYS 的六个检查点均有真实工具及服务器调用记录，
+没有反馈重试；ALWAYS 使用三个独立数据库和新 session／原生 thread，共享 CODEX_HOME。
+BCC 两次 steering 被接受，五秒提醒在 5.009 秒后触发，一次拒绝的命令为 declined 且未启动进程。
+BCC 两个完成检查点均没有 Channel outbound，保留该回信覆盖边界。
+full-access 写入 56 字节实际便笺并通过 bcc 交付文件名和摘要，没有人工审批交互。
+进程恢复保留原 session／原生 thread；指令刷新产生新 session／原生 thread。
+后台预览在启动、超过两秒空闲期限和后续对话后均返回 HTTP 200，三次监听均为 loopback；
+前两次完成回合各交付一条 Channel 消息，第三个活动回合关闭后停止监听且所属预览进程为空。
+
+共 1308 条 AuditEvent、1147 条 HarnessOutput 通过 rc7 公共模型验证；1139 条输出存在
+内容相同的审计 payload，宿主／原生关联字段逐项一致。关闭阶段另有七条 cancelled 和一条 usage
+输出缺少相同 AuditEvent payload，原样保留这八条缺口，不宣称严格全量审计等价或全量后端用量配对。
+原始日志及 228 个文件的 bcc-acceptance 产物已下载并通过 CRC、安全路径和 SHA-256 校验；
+产物 ID `12655885608`，1181372 字节，摘要与 GitHub 一致：
+`cd942530b5685a30c67a96aa0b3c6b6c0b02168dd823703183417825c43e07f7`。
+本次回填仅更新本原计划，生产代码、测试及依赖与实际验收提交字节一致；只 amend 本轮新增的
+入口超时修订签名提交，保留其基线提交 `8389c4b5afceab5ba572a179c57e48d2b101142a`，供人工 review。
+
 ### RC7 Timer 超时接入（2026-10-26）
 
 开发线程消息 `ca85894a-dbf0-5db1-bb3a-1fbdf9cd5ab5` 授权接入已发布 RC7 的公共 Timer 超时封装。

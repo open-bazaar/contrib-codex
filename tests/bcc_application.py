@@ -125,6 +125,10 @@ async def exercise():
             if process.returncode is not None:
                 raise RuntimeError("The isolated node exited; inspect node.log")
             await asyncio.sleep(0.05)
+        inspection = json.loads((root / "inspection.json").read_text())
+        assert inspection["available"] and inspection["version"], inspection
+        assert inspection["models"] and not inspection["error"], inspection
+        print(json.dumps({"inspection": inspection}), flush=True)
         reader, writer = await asyncio.open_connection(
             "127.0.0.1", json.loads(endpoint.read_text())["port"]
         )

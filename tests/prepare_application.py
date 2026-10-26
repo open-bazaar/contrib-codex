@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import subprocess
@@ -14,8 +13,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import tomli_w
-
-from bazaar_contrib_codex import BuilderConfig
 
 root = Path(sys.argv[1]).resolve()
 root.mkdir(exist_ok=True)
@@ -62,7 +59,9 @@ agents = [
         "name": "Assistant",
         "workspace": str(workspace),
         "mode": "session",
-        "channel": [{"kind": "test-channel"}],
+        "channel": [
+            {"kind": "test-channel", "inspection_file": str(root / "inspection.json")}
+        ],
         "harness": [{"kind": "codex", "model": model}],
     }
 ]
@@ -146,10 +145,6 @@ with (root / "activation.log").open("w") as log:
 print((root / "activation.log").read_text(), end="", flush=True)
 result.check_returncode()
 os.environ.update(environment)
-inspection = asyncio.run(BuilderConfig.inspect(workspace, timeout=30))
-(root / "inspection.json").write_text(inspection.model_dump_json(indent=2) + "\n")
-print(json.dumps({"inspection": inspection.model_dump(mode="json")}), flush=True)
-assert inspection.available and inspection.version and not inspection.error, inspection
 print(
     json.dumps(
         {

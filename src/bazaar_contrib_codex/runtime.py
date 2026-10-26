@@ -281,20 +281,24 @@ class TurnStream:
             )
 
     async def aclose(self):
-        if (
-            not self.finished
-            and self.provider_turn_id is not None
-            and self.connection.server.process.returncode is None
-        ):
-            await self.connection.server.request(
-                "turn/interrupt",
-                {
-                    "threadId": self.connection.session.provider_thread_id,
-                    "turnId": self.provider_turn_id,
-                },
-                timeout=self.timeout,
-            )
-        self.finished = True
+        try:
+            if (
+                not self.finished
+                and self.provider_turn_id is not None
+                and self.connection.server.process.returncode is None
+            ):
+                async with timer_timeout(
+                    self.connection.owner.timer, ceil(self.timeout * 1000)
+                ):
+                    await self.connection.server.request(
+                        "turn/interrupt",
+                        {
+                            "threadId": self.connection.session.provider_thread_id,
+                            "turnId": self.provider_turn_id,
+                        },
+                    )
+        finally:
+            self.finished = True
 
 
 class Connection:
@@ -309,41 +313,22 @@ class Connection:
         self.home: Path | None = None
 
     async def open(self, *, timeout: float):
-        self.timeout = timeout
-        for attempt in range(2):
-            try:
-                async with timer_timeout(
-                    self.owner.timer, ceil(self.owner.input.startup_timeout * 1000)
-                ):
-                    self.server = await AppServer.start(
-                        self.request.workspace,
-                        self.request.environment,
-                        self.answer,
-                        self.notify,
-                        timer=self.owner.timer,
-                        timeout=timeout,
-                    )
-                    result = await self.server.initialize(
-                        timeout=self.owner.input.startup_timeout
-                    )
-                    self.home = Path(result["codexHome"])
-                    await self.watch(timeout=self.owner.input.startup_timeout)
-                return
-            except TimeoutError as error:
-                logger.warning(
-                    "Codex initialization attempt %s failed for session %s: %s",
-                    attempt + 1,
-                    self.session.id,
-                    error,
-                )
-                if hasattr(self, "server"):
-                    await self.server.aclose(timeout=self.owner.input.shutdown_timeout)
-                if attempt:
-                    raise
-            except BaseException:
-                if hasattr(self, "server"):
-                    await self.server.aclose(timeout=self.owner.input.shutdown_timeout)
-                raise
+        try:
+            self.server = await AppServer.start(
+                self.request.workspace,
+                self.request.environment,
+                self.answer,
+                self.notify,
+                timer=self.owner.timer,
+                timeout=timeout,
+            )
+            result = await self.server.initialize()
+            self.home = Path(result["codexHome"])
+            await self.watch()
+        except BaseException:
+            if hasattr(self, "server"):
+                self.owner.close(self)
+            raise
 
     async def answer(self, packet: Packet) -> dict[str, Any]:
         stream = self.stream
@@ -381,7 +366,7 @@ class Connection:
         ):
             self.owner.events.put_nowait(HarnessExpire(session_id=self.session.id))
 
-    async def watch(self, *, timeout: float):
+    async def watch(self):
         assert self.home is not None
         self.watch_targets = {
             "workspace": self.request.workspace / "AGENTS.md",
@@ -395,7 +380,6 @@ class Connection:
                         "watchId": id,
                         "path": str(path),
                     },
-                    timeout=timeout,
                 )
             )
             if result.path != path:
@@ -421,6 +405,13 @@ class CodexHarness:
         self.sessions: dict[str, SessionInput] = {}
         self.turns: dict[str, tuple[str, str]] = {}
         self.events: asyncio.Queue[HarnessExpire] = asyncio.Queue()
+        self.closing: set[asyncio.Task[None]] = set()
+
+    def close(self, connection: Connection) -> asyncio.Task[None]:
+        task = connection.server.close(timeout=self.input.shutdown_timeout)
+        self.closing.add(task)
+        task.add_done_callback(self.closing.discard)
+        return task
 
     async def receive_event(self) -> HarnessExpire:
         return await self.events.get()
@@ -434,43 +425,33 @@ class CodexHarness:
         self.sessions[request.id] = request
         previous = self.connections.pop(request.id, None)
         if previous is not None:
-            await previous.server.aclose(timeout=self.input.shutdown_timeout)
+            self.close(previous)
         connection = Connection(self, request)
         try:
-            await connection.open(timeout=timeout)
-        except Exception as error:  # noqa: BLE001 -- Report provider startup failures.
-            return ProviderCallResult(
-                status=ProviderCallStatus.FAILED,
-                failure=failure(
-                    error,
-                    needs_reconciliation=isinstance(
-                        error, (AppServerUnavailable, TimeoutError)
-                    ),
-                ),
-            )
-        try:
-            result = await connection.server.request(
-                "thread/start",
-                {
-                    "cwd": str(request.workspace),
-                    "model": self.model,
-                    "developerInstructions": "\n\n".join(request.instructions),
-                    "approvalPolicy": "on-request",
-                    "sandbox": SANDBOX_POLICIES[request.sandbox_policy],
-                },
-                timeout=timeout,
-            )
-            connection.session = HarnessSession(
-                id=request.id, provider_thread_id=result["thread"]["id"]
-            )
+            async with timer_timeout(
+                self.timer, ceil(min(timeout, self.input.startup_timeout) * 1000)
+            ):
+                await connection.open(timeout=timeout)
+                result = await connection.server.request(
+                    "thread/start",
+                    {
+                        "cwd": str(request.workspace),
+                        "model": self.model,
+                        "developerInstructions": "\n\n".join(request.instructions),
+                        "approvalPolicy": "on-request",
+                        "sandbox": SANDBOX_POLICIES[request.sandbox_policy],
+                    },
+                )
+                connection.session = HarnessSession(
+                    id=request.id, provider_thread_id=result["thread"]["id"]
+                )
             self.connections[request.id] = connection
             return ProviderCallResult(
                 status=ProviderCallStatus.CONFIRMED, value=connection.session
             )
         except BaseException as error:
-            await connection.server.aclose(
-                timeout=min(timeout, self.input.shutdown_timeout)
-            )
+            if hasattr(connection, "server"):
+                self.close(connection)
             if isinstance(
                 error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
             ):
@@ -509,31 +490,31 @@ class CodexHarness:
                 else {"type": "text", "text": f"Attached file: {attachment.path}"}
             )
         try:
-            result = await connection.server.request(
-                "turn/start",
-                {
-                    "threadId": session.provider_thread_id,
-                    "input": inputs,
-                    "clientUserMessageId": turn.id,
-                    "cwd": str(connection.request.workspace),
-                    "model": self.model,
-                    "effort": self.effort,
-                    "approvalPolicy": "on-request",
-                    "sandboxPolicy": (
-                        {"type": "dangerFullAccess"}
-                        if connection.request.sandbox_policy
-                        is SandboxPolicy.DANGER_FULL_ACCESS
-                        else {
-                            "type": "workspaceWrite",
-                            "writableRoots": [str(connection.request.workspace)],
-                            "networkAccess": True,
-                        }
-                    ),
-                },
-                timeout=timeout,
-            )
-            stream.provider_turn_id = result["turn"]["id"]
-            self.turns[session.id] = (turn.id, result["turn"]["id"])
+            async with timer_timeout(self.timer, ceil(timeout * 1000)):
+                result = await connection.server.request(
+                    "turn/start",
+                    {
+                        "threadId": session.provider_thread_id,
+                        "input": inputs,
+                        "clientUserMessageId": turn.id,
+                        "cwd": str(connection.request.workspace),
+                        "model": self.model,
+                        "effort": self.effort,
+                        "approvalPolicy": "on-request",
+                        "sandboxPolicy": (
+                            {"type": "dangerFullAccess"}
+                            if connection.request.sandbox_policy
+                            is SandboxPolicy.DANGER_FULL_ACCESS
+                            else {
+                                "type": "workspaceWrite",
+                                "writableRoots": [str(connection.request.workspace)],
+                                "networkAccess": True,
+                            }
+                        ),
+                    },
+                )
+                stream.provider_turn_id = result["turn"]["id"]
+                self.turns[session.id] = (turn.id, result["turn"]["id"])
         except (
             AppServerError,
             OSError,
@@ -564,15 +545,15 @@ class CodexHarness:
         if stream.turn.id != turn.id or stream.provider_turn_id is None:
             return False
         try:
-            result = await connection.server.request(
-                "turn/steer",
-                {
-                    "threadId": session.provider_thread_id,
-                    "expectedTurnId": stream.provider_turn_id,
-                    "input": [{"type": "text", "text": input_text}],
-                },
-                timeout=timeout,
-            )
+            async with timer_timeout(self.timer, ceil(timeout * 1000)):
+                result = await connection.server.request(
+                    "turn/steer",
+                    {
+                        "threadId": session.provider_thread_id,
+                        "expectedTurnId": stream.provider_turn_id,
+                        "input": [{"type": "text", "text": input_text}],
+                    },
+                )
         except AppServerError, OSError, TimeoutError:
             return False
         return result["turnId"] == stream.provider_turn_id
@@ -607,119 +588,140 @@ class CodexHarness:
                 )
             connection = Connection(self, request)
             connection.session = session
-        for attempt in range(2):
-            try:
-                if (
-                    not hasattr(connection, "server")
-                    or connection.server.process.returncode is not None
-                    or connection.server.reader.done()
-                ):
-                    if hasattr(connection, "server"):
-                        await connection.server.aclose(
-                            timeout=self.input.shutdown_timeout
+        try:
+            async with timer_timeout(self.timer, ceil(timeout * 1000)):
+                for attempt in range(2):
+                    try:
+                        if (
+                            not hasattr(connection, "server")
+                            or connection.server.closed
+                            or connection.server.process.returncode is not None
+                            or connection.server.reader.done()
+                        ):
+                            if hasattr(connection, "server"):
+                                self.close(connection)
+                            await connection.open(timeout=timeout)
+                        result = await connection.server.request(
+                            "thread/read",
+                            {
+                                "threadId": session.provider_thread_id,
+                                "includeTurns": True,
+                            },
                         )
-                    await connection.open(timeout=timeout)
-                result = await connection.server.request(
-                    "thread/read",
-                    {"threadId": session.provider_thread_id, "includeTurns": True},
-                    timeout=timeout,
-                )
-                thread = result["thread"]
-                if thread["id"] != session.provider_thread_id:
-                    raise AppServerError(
-                        "Codex returned a different provider thread",
-                        reason=HarnessFailureReason.STATE_MISMATCH,
-                    )
-                previous = connection.stream
-                status = thread["status"]["type"]
-                stream = None
-                if status == "active":
-                    turns = [
-                        item
-                        for item in thread["turns"]
-                        if item["status"] == "inProgress"
-                    ]
-                    if (
-                        turn is None
-                        or approval_handler is None
-                        or len(turns) != 1
-                        or self.turns.get(session.id) != (turn.id, turns[0]["id"])
-                    ):
-                        raise AppServerError(
-                            "The active Codex turn cannot be reconciled",
-                            reason=HarnessFailureReason.STATE_MISMATCH,
-                        )
-                    if previous is not None:
-                        previous.finished = True
-                    stream = TurnStream(connection, turn, approval_handler, timeout)
-                    stream.provider_turn_id = turns[0]["id"]
-                    connection.stream = stream
-                elif status in {"idle", "notLoaded"}:
-                    response = await connection.server.request(
-                        "thread/resume",
-                        {
-                            "threadId": session.provider_thread_id,
-                            "cwd": str(connection.request.workspace),
-                            "model": self.model,
-                            "developerInstructions": "\n\n".join(
-                                connection.request.instructions
+                        thread = result["thread"]
+                        if thread["id"] != session.provider_thread_id:
+                            raise AppServerError(
+                                "Codex returned a different provider thread",
+                                reason=HarnessFailureReason.STATE_MISMATCH,
+                            )
+                        previous = connection.stream
+                        status = thread["status"]["type"]
+                        stream = None
+                        if status == "active":
+                            turns = [
+                                item
+                                for item in thread["turns"]
+                                if item["status"] == "inProgress"
+                            ]
+                            if (
+                                turn is None
+                                or approval_handler is None
+                                or len(turns) != 1
+                                or self.turns.get(session.id)
+                                != (turn.id, turns[0]["id"])
+                            ):
+                                raise AppServerError(
+                                    "The active Codex turn cannot be reconciled",
+                                    reason=HarnessFailureReason.STATE_MISMATCH,
+                                )
+                            if previous is not None:
+                                previous.finished = True
+                            stream = TurnStream(
+                                connection, turn, approval_handler, timeout
+                            )
+                            stream.provider_turn_id = turns[0]["id"]
+                            connection.stream = stream
+                        elif status in {"idle", "notLoaded"}:
+                            response = await connection.server.request(
+                                "thread/resume",
+                                {
+                                    "threadId": session.provider_thread_id,
+                                    "cwd": str(connection.request.workspace),
+                                    "model": self.model,
+                                    "developerInstructions": "\n\n".join(
+                                        connection.request.instructions
+                                    ),
+                                    "approvalPolicy": "on-request",
+                                    "sandbox": SANDBOX_POLICIES[
+                                        connection.request.sandbox_policy
+                                    ],
+                                },
+                            )
+                            if response["thread"]["id"] != session.provider_thread_id:
+                                raise AppServerError(
+                                    "Codex resumed a different provider thread",
+                                    reason=HarnessFailureReason.STATE_MISMATCH,
+                                )
+                            if previous is not None:
+                                previous.finished = True
+                            connection.stream = None
+                        else:
+                            raise AppServerError(
+                                f"Unsupported Codex thread status: {status}",
+                                reason=HarnessFailureReason.PROTOCOL,
+                            )
+                        self.connections[session.id] = connection
+                        return ProviderCallResult(
+                            status=ProviderCallStatus.CONFIRMED,
+                            value=HarnessSessionReconciliation(
+                                connection.session, stream
                             ),
-                            "approvalPolicy": "on-request",
-                            "sandbox": SANDBOX_POLICIES[
-                                connection.request.sandbox_policy
-                            ],
-                        },
-                        timeout=timeout,
-                    )
-                    if response["thread"]["id"] != session.provider_thread_id:
-                        raise AppServerError(
-                            "Codex resumed a different provider thread",
-                            reason=HarnessFailureReason.STATE_MISMATCH,
                         )
-                    if previous is not None:
-                        previous.finished = True
-                    connection.stream = None
-                else:
-                    raise AppServerError(
-                        f"Unsupported Codex thread status: {status}",
-                        reason=HarnessFailureReason.PROTOCOL,
-                    )
-                self.connections[session.id] = connection
-                return ProviderCallResult(
-                    status=ProviderCallStatus.CONFIRMED,
-                    value=HarnessSessionReconciliation(connection.session, stream),
-                )
-            except asyncio.CancelledError:
-                if hasattr(connection, "server"):
-                    await connection.server.aclose(timeout=self.input.shutdown_timeout)
-                raise
-            except (AppServerUnavailable, TimeoutError) as error:
-                logger.warning(
-                    "Codex recovery attempt %s failed for session %s: %s",
-                    attempt + 1,
-                    session.id,
-                    error,
-                )
-                if hasattr(connection, "server"):
-                    await connection.server.aclose(timeout=self.input.shutdown_timeout)
-                if attempt == 0:
-                    continue
-                return ProviderCallResult(
-                    status=ProviderCallStatus.FAILED,
-                    failure=failure(error, needs_reconciliation=True),
-                )
-            except (AppServerError, OSError, KeyError, TypeError, ValueError) as error:
-                if hasattr(connection, "server"):
-                    await connection.server.aclose(timeout=self.input.shutdown_timeout)
-                if isinstance(error, (KeyError, TypeError, ValueError)):
-                    error = AppServerError(
-                        str(error), reason=HarnessFailureReason.PROTOCOL
-                    )
-                return ProviderCallResult(
-                    status=ProviderCallStatus.FAILED,
-                    failure=failure(error, needs_reconciliation=False),
-                )
-        raise AssertionError("Codex reconciliation did not return")
+                    except asyncio.CancelledError:
+                        if hasattr(connection, "server"):
+                            self.close(connection)
+                        raise
+                    except AppServerUnavailable as error:
+                        logger.warning(
+                            "Codex recovery attempt %s failed for session %s: %s",
+                            attempt + 1,
+                            session.id,
+                            error,
+                        )
+                        if hasattr(connection, "server"):
+                            self.close(connection)
+                        if attempt == 0:
+                            continue
+                        return ProviderCallResult(
+                            status=ProviderCallStatus.FAILED,
+                            failure=failure(error, needs_reconciliation=True),
+                        )
+                    except (
+                        AppServerError,
+                        OSError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        if hasattr(connection, "server"):
+                            self.close(connection)
+                        if isinstance(error, (KeyError, TypeError, ValueError)):
+                            error = AppServerError(
+                                str(error), reason=HarnessFailureReason.PROTOCOL
+                            )
+                        return ProviderCallResult(
+                            status=ProviderCallStatus.FAILED,
+                            failure=failure(error, needs_reconciliation=False),
+                        )
+                raise AssertionError("Codex reconciliation did not return")
+
+        except TimeoutError as error:
+            if hasattr(connection, "server"):
+                self.close(connection)
+            return ProviderCallResult(
+                status=ProviderCallStatus.FAILED,
+                failure=failure(error, needs_reconciliation=True),
+            )
 
     async def has_background_job(
         self, session: HarnessSession, *, timeout: float
@@ -728,13 +730,13 @@ class CodexHarness:
         if connection is None:
             return False
         try:
-            result = await connection.server.request(
-                "thread/backgroundTerminals/list",
-                {
-                    "threadId": session.provider_thread_id,
-                },
-                timeout=timeout,
-            )
+            async with timer_timeout(self.timer, ceil(timeout * 1000)):
+                result = await connection.server.request(
+                    "thread/backgroundTerminals/list",
+                    {
+                        "threadId": session.provider_thread_id,
+                    },
+                )
         except AppServerError, OSError, TimeoutError:
             # An unavailable status cannot establish that the session is idle.
             return True
@@ -750,15 +752,27 @@ class CodexHarness:
         self.turns.pop(session.id, None)
         connection = self.connections.pop(session.id, None)
         if connection is not None:
-            await connection.server.aclose(
-                timeout=min(timeout, self.input.shutdown_timeout)
-            )
+            task = self.close(connection)
+            try:
+                async with timer_timeout(
+                    self.timer, ceil(min(timeout, self.input.shutdown_timeout) * 1000)
+                ):
+                    await asyncio.shield(task)
+            except TimeoutError as error:
+                return ProviderCallResult(
+                    status=ProviderCallStatus.FAILED,
+                    failure=failure(error, needs_reconciliation=False),
+                )
         return ProviderCallResult(status=ProviderCallStatus.CONFIRMED, value=session)
 
     async def aclose(self):
         for connection in tuple(self.connections.values()):
-            await self.stop_session(
-                connection.session, timeout=self.input.shutdown_timeout
-            )
+            self.close(connection)
+        self.connections.clear()
         self.sessions.clear()
         self.turns.clear()
+        if self.closing:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tuple(self.closing)),
+                return_exceptions=True,
+            )

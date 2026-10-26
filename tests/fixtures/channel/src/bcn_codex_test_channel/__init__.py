@@ -41,7 +41,7 @@ from bazaar_contrib_channel import (
     SenderIdentity,
     channel_builder_key,
 )
-from bazaar_contrib_harness import ApprovalResult, HarnessOutput
+from bazaar_contrib_harness import ApprovalResult, HarnessOutput, harness_builder_key
 from bazaar_contrib_timer import TIMER, Timer
 from bazaar_contrib_timer import timeout as timer_timeout
 from bazaar_core import Composition, Context, Contrib, ContribEntry
@@ -52,6 +52,7 @@ class ChannelConfig(BaseModel):
     kind: ClassVar[str] = "test-channel"
     model_config = ConfigDict(extra="forbid", frozen=True)
     endpoint_file: str = "channel.json"
+    inspection_file: Path
 
 
 class Attachment(BaseModel):
@@ -319,6 +320,13 @@ class TestChannel:
 @asynccontextmanager
 async def channel_lifespan(ctx: Context, config: ChannelConfig):
     input = ctx.accept(CHANNEL_INPUT)
+    async with timer_timeout(ctx.accept(TIMER), 30_000):
+        inspection = await ctx.accept(harness_builder_key("codex")).inspect(
+            input.workspace, timeout=30
+        )
+    await asyncio.to_thread(
+        config.inspection_file.write_text, inspection.model_dump_json(indent=2) + "\n"
+    )
     async with asyncio.TaskGroup() as group:
         channel = TestChannel(input, group, config.kind, ctx.accept(TIMER))
 
@@ -367,7 +375,7 @@ async def channel_lifespan(ctx: Context, config: ChannelConfig):
 
 channel = Contrib(
     config=ChannelConfig,
-    accepts=[CHANNEL_INPUT, TIMER],
+    accepts=[CHANNEL_INPUT, TIMER, harness_builder_key("codex")],
     offers=[CHANNEL],
     lifespan=channel_lifespan,
 )

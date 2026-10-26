@@ -11,7 +11,7 @@ import logging
 import os
 import signal
 import subprocess
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from importlib.metadata import version
 from math import ceil
 from pathlib import Path
@@ -24,6 +24,21 @@ from bazaar_contrib_timer import timeout as timer_timeout
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 logger = logging.getLogger(__name__)
+cleanup: set[asyncio.Task[Any]] = set()
+
+
+def background[T](work: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
+    """Retain detached cleanup and consume its outcome without delaying callers."""
+    task = asyncio.create_task(work)
+    cleanup.add(task)
+
+    def finished(task: asyncio.Task[T]):
+        cleanup.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Codex background cleanup failed", exc_info=error)
+
+    task.add_done_callback(finished)
+    return task
 
 
 class Packet(BaseModel):
@@ -106,10 +121,9 @@ class AppServer:
         self.reader = asyncio.create_task(self.read())
         self.errors = asyncio.create_task(self.read_errors())
         self.watcher = asyncio.create_task(self.watch())
-        self.reapers: set[asyncio.Task[None]] = set()
         self.error: Exception | None = None
         self.closed = False
-        self.closing = asyncio.Lock()
+        self.closing: asyncio.Task[None] | None = None
 
     @classmethod
     async def start(
@@ -137,7 +151,7 @@ class AppServer:
         )
         return cls(process, handler, notify, timeout, timer=timer)
 
-    async def initialize(self, *, timeout: float) -> dict[str, Any]:
+    async def initialize(self) -> dict[str, Any]:
         result = await self.request(
             "initialize",
             {
@@ -147,12 +161,11 @@ class AppServer:
                 },
                 "capabilities": {"experimentalApi": True},
             },
-            timeout=timeout,
         )
-        await self.write({"method": "initialized"}, timeout=timeout)
+        await self.write({"method": "initialized"})
         return result
 
-    async def write(self, packet: dict[str, Any], *, timeout: float):
+    async def write(self, packet: dict[str, Any]):
         if self.error is not None:
             raise self.error
         stdin = self.process.stdin
@@ -163,12 +176,7 @@ class AppServer:
             or self.process.returncode is not None
         ):
             raise AppServerUnavailable("Codex app-server is no longer running")
-        async with (
-            timer_timeout(self.timer, ceil(timeout * 1000))
-            if self.timer is not None
-            else asyncio.timeout(timeout),
-            self.writing,
-        ):
+        async with self.writing:
             stdin.write(json.dumps(packet).encode() + b"\n")
             await stdin.drain()
 
@@ -176,27 +184,14 @@ class AppServer:
         self,
         method: str,
         params: dict[str, Any],
-        *,
-        timeout: float,
     ) -> dict[str, Any]:
         self.sequence += 1
         id = self.sequence
         future = asyncio.get_running_loop().create_future()
         self.pending[id] = future
         try:
-            async with (
-                timer_timeout(self.timer, ceil(timeout * 1000))
-                if self.timer is not None
-                else asyncio.timeout(timeout)
-            ):
-                await self.write(
-                    {"id": id, "method": method, "params": params}, timeout=timeout
-                )
-                return await future
-        except TimeoutError as error:
-            raise TimeoutError(
-                f"Codex {method} timed out after {timeout:g} seconds"
-            ) from error
+            await self.write({"id": id, "method": method, "params": params})
+            return await future
         finally:
             self.pending.pop(id, None)
             if not future.done():
@@ -206,8 +201,13 @@ class AppServer:
 
     async def answer(self, packet: Packet):
         try:
-            result = await self.handler(packet)
-            await self.write({"id": packet.id, "result": result}, timeout=self.timeout)
+            async with (
+                timer_timeout(self.timer, ceil(self.timeout * 1000))
+                if self.timer is not None
+                else asyncio.timeout(self.timeout)
+            ):
+                result = await self.handler(packet)
+                await self.write({"id": packet.id, "result": result})
         except Exception:
             logger.exception(
                 "Could not send the response to Codex request %s", packet.id
@@ -230,6 +230,8 @@ class AppServer:
                         continue
                     packet = Packet.model_validate_json(line)
                     if packet.method is not None:
+                        if self.closed:
+                            continue
                         self.notify(packet)
                         self.events.put_nowait(packet)
                         if packet.id is not None and not self.closed:
@@ -312,21 +314,14 @@ class AppServer:
             for line in chunk.decode(errors="replace").splitlines():
                 logger.debug("Codex app-server stderr: %s", line)
 
+    def close(self, *, timeout: float) -> asyncio.Task[None]:
+        if self.closing is None:
+            self.closed = True
+            self.closing = background(self._close(timeout=timeout))
+        return self.closing
+
     async def aclose(self, *, timeout: float):
-        self.closed = True
-        # Caller cancellation must not interrupt the owned, bounded cleanup.
-        finished = asyncio.gather(self._close(timeout=timeout), return_exceptions=True)
-        cancellation: asyncio.CancelledError | None = None
-        while True:
-            try:
-                (result,) = await asyncio.shield(finished)
-                break
-            except asyncio.CancelledError as error:
-                cancellation = error
-        if cancellation is not None:
-            raise cancellation
-        if isinstance(result, BaseException):
-            raise result
+        await asyncio.shield(self.close(timeout=timeout))
 
     async def _close(self, *, timeout: float):
         loop = asyncio.get_running_loop()
@@ -338,8 +333,7 @@ class AppServer:
             async with (
                 timer_timeout(self.timer, ceil(deadline_ms - self.timer.now_ms))
                 if self.timer is not None
-                else asyncio.timeout_at(deadline_ms / 1000),
-                self.closing,
+                else asyncio.timeout_at(deadline_ms / 1000)
             ):
                 for task in self.requests.values():
                     task.cancel()
@@ -446,18 +440,12 @@ class AppServer:
             if self.process.returncode is None or any(
                 not task.done() for task in tasks
             ):
-                # Disconnect retained pipes so a grandchild cannot hold the
-                # shutdown caller past its deadline. Keep an owned reaper.
+                # Reap the killed process inside this owned background task.
                 transport = getattr(self.process, "_transport", None)
                 if transport is not None:
                     for fd in (1, 2):
                         pipe = transport.get_pipe_transport(fd)
                         if pipe is not None:
                             pipe.close()
-                reaper = asyncio.create_task(self.reap(tasks))
-                self.reapers.add(reaper)
-                reaper.add_done_callback(self.reapers.discard)
-
-    async def reap(self, tasks: tuple[asyncio.Task[None], ...]):
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await self.process.wait()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.process.wait()

@@ -10,33 +10,30 @@ from typing import Any
 from bazaar_contrib_harness import HarnessInspection, HarnessModel, HarnessSkill
 
 from .approval import decline
-from .transport import AppServer, AppServerError, Packet
+from .transport import AppServer, AppServerError, Packet, background
 
 logger = logging.getLogger(__name__)
 
 
 async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # noqa: ASYNC109
     try:
-        async with asyncio.timeout(timeout):
-            process = await asyncio.create_subprocess_exec(
-                "codex",
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-    except (OSError, TimeoutError) as error:
+        process = await asyncio.create_subprocess_exec(
+            "codex",
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as error:
         return HarnessInspection(available=False, error=str(error))
     try:
-        async with asyncio.timeout(timeout):
-            stdout, stderr = await process.communicate()
-    except TimeoutError as error:
-        return HarnessInspection(
-            available=False, error=str(error) or type(error).__name__
-        )
+        stdout, stderr = await process.communicate()
     finally:
         if process.returncode is None:
-            process.kill()
-            await process.wait()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            background(process.communicate())
     if process.returncode or not stdout.strip():
         return HarnessInspection(
             available=False,
@@ -53,22 +50,19 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
         return decline(packet)
 
     try:
-        async with asyncio.timeout(timeout):
-            server = await AppServer.start(
-                workspace,
-                {},
-                answer,
-                lambda packet: logger.debug(
-                    "Codex inspection notification: %s", packet.method
-                ),
-                timeout=timeout,
-            )
-            await server.initialize(timeout=timeout)
+        server = await AppServer.start(
+            workspace,
+            {},
+            answer,
+            lambda packet: logger.debug(
+                "Codex inspection notification: %s", packet.method
+            ),
+            timeout=timeout,
+        )
+        await server.initialize()
         cursor = None
         while True:
-            page = await server.request(
-                "model/list", {"cursor": cursor}, timeout=timeout
-            )
+            page = await server.request("model/list", {"cursor": cursor})
             models.extend(
                 HarnessModel(
                     id=item["model"],
@@ -86,9 +80,7 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
             cursor = page.get("nextCursor")
             if cursor is None:
                 break
-        result = await server.request(
-            "skills/list", {"cwds": [str(workspace)]}, timeout=timeout
-        )
+        result = await server.request("skills/list", {"cwds": [str(workspace)]})
         skills = tuple(
             HarnessSkill(
                 name=skill["name"],
@@ -115,7 +107,7 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
             )
             or None,
         )
-    except (AppServerError, OSError, TimeoutError) as error:
+    except (AppServerError, OSError) as error:
         return HarnessInspection(
             available=True,
             version=version,
@@ -125,4 +117,4 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
         )
     finally:
         if server is not None:
-            await server.aclose(timeout=timeout)
+            server.close(timeout=timeout)
