@@ -16,8 +16,9 @@ from uuid import uuid7
 
 import psutil
 import tomli_w
+from bazaar_contrib_audit import AuditEvent
 from bazaar_contrib_channel import ChannelApprovalRequest, ChannelTarget, SenderIdentity
-from bazaar_contrib_harness import ApprovalResult, ApprovalScope
+from bazaar_contrib_harness import ApprovalResult, ApprovalScope, HarnessOutput
 from bcn_codex_test_channel import ChannelMessage
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -182,6 +183,45 @@ async def exercise():
         print(json.dumps({"node_stopped": record}), flush=True)
         assert process.returncode == 0, record
         assert not alive, record
+        audits: dict[str, list[AuditEvent]] = {}
+        outputs = []
+        for line in (root / "events.jsonl").read_text().splitlines():
+            packet = json.loads(line)
+            if "audit" in packet:
+                audit = AuditEvent.model_validate(packet["audit"])
+                audits.setdefault(json.dumps(audit.payload, sort_keys=True), []).append(
+                    audit
+                )
+            if "event" in packet:
+                outputs.append(
+                    (packet["phase"], HarnessOutput.model_validate(packet["event"]))
+                )
+        unmatched = []
+        for output_phase, output in outputs:
+            candidates = audits.get(
+                json.dumps(output.model_dump(mode="json"), sort_keys=True), []
+            )
+            if not any(
+                audit.event_name == f"harness.{output.kind}"
+                and all(
+                    getattr(audit.context, field) == getattr(output, field)
+                    for field in (
+                        "session_id",
+                        "turn_id",
+                        "provider_session_id",
+                        "provider_turn_id",
+                    )
+                    if getattr(output, field) is not None
+                )
+                for audit in candidates
+            ):
+                unmatched.append(
+                    {"phase": output_phase, **output.model_dump(mode="json")}
+                )
+        coverage = {"outputs": len(outputs), "unmatched": unmatched}
+        (root / "audit-coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
+        print(json.dumps({"audit_coverage": coverage}), flush=True)
+        assert outputs and not unmatched, coverage
 
     async def restart(number):
         nonlocal process, writer, collector

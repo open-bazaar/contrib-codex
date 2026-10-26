@@ -24,8 +24,3 @@ Optional fields in the agent's `codex` Harness configuration:
 
 - `model`: Codex model; defaults to the Codex configuration.
 - `effort`: Reasoning effort; defaults to the Codex configuration.
-
-Metadata queries use the caller's timeout scope around the registered Builder's
-`inspect` call. The supplied numeric timeout bounds background process cleanup;
-initialization and pagination inherit the caller's cancellation. Session operations
-each enforce their supplied budget across all requests and recovery attempts.

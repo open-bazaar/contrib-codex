@@ -44,7 +44,7 @@ from bazaar_contrib_channel import (
 from bazaar_contrib_harness import ApprovalResult, HarnessOutput, harness_builder_key
 from bazaar_contrib_timer import TIMER, Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from bazaar_core import Composition, Context, Contrib, ContribEntry
+from bazaar_core import Context, Contrib
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
@@ -220,6 +220,7 @@ class TestChannel:
             writer = self.writer
             writer.write(json.dumps(packet).encode() + b"\n")
             await writer.drain()
+            self.outbound.task_done()
 
     async def receive(self) -> AsyncIterator[InboundMessage]:
         while True:
@@ -317,6 +318,12 @@ class TestChannel:
             self.pending.pop(id, None)
 
 
+def record(ctx: Context, event: AuditEvent):
+    channel = cast(TestChannel, ctx.accept(CHANNEL))
+    if event.context.agent_id == channel.input.agent_id:
+        channel.outbound.put_nowait({"audit": event.model_dump(mode="json")})
+
+
 @asynccontextmanager
 async def channel_lifespan(ctx: Context, config: ChannelConfig):
     input = ctx.accept(CHANNEL_INPUT)
@@ -329,10 +336,6 @@ async def channel_lifespan(ctx: Context, config: ChannelConfig):
     )
     async with asyncio.TaskGroup() as group:
         channel = TestChannel(input, group, config.kind, ctx.accept(TIMER))
-
-        def record(ctx: Context, event: AuditEvent):
-            if event.context.agent_id == input.agent_id:
-                channel.outbound.put_nowait({"audit": event.model_dump(mode="json")})
 
         server = await asyncio.start_server(channel.connect, "127.0.0.1", 0)
         pump = group.create_task(channel.pump())
@@ -350,20 +353,11 @@ async def channel_lifespan(ctx: Context, config: ChannelConfig):
         await asyncio.to_thread(temporary.replace, endpoint)
         ctx.offer(CHANNEL, channel)
         try:
-            async with ctx.enable(
-                Composition(
-                    entries=(
-                        ContribEntry(
-                            name="test-channel-audit",
-                            definition=Contrib(listen={AUDIT_EVENT: record}),
-                        ),
-                    )
-                )
-            ):
-                yield
+            yield
         finally:
             server.close()
             if channel.writer is not None:
+                await channel.outbound.join()
                 channel.writer.close()
                 await channel.writer.wait_closed()
             pump.cancel()
@@ -378,6 +372,7 @@ channel = Contrib(
     accepts=[CHANNEL_INPUT, TIMER, harness_builder_key("codex")],
     offers=[CHANNEL],
     lifespan=channel_lifespan,
+    listen={AUDIT_EVENT: record},
 )
 
 
