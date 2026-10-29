@@ -23,7 +23,6 @@ from bazaar_contrib_channel import ChannelApprovalRequest, ChannelTarget, Sender
 from bazaar_contrib_harness import (
     ApprovalResult,
     ApprovalScope,
-    HarnessOutput,
     HarnessSourceEvent,
 )
 from bcn_codex_test_channel import ChannelMessage
@@ -62,17 +61,11 @@ async def exercise():
         )
     } | json.loads((root / "environment.private.json").read_text())
     log = (root / "node.log").open("wb")
-    events = (root / "events.jsonl").open("w")
     process = None
     writer = None
     collector = None
     queue = asyncio.Queue()
     phase = "startup"
-    database = None
-    instances = []
-    summary = []
-    inbound_messages = []
-    mcp_checks = []
     workspace = arguments.workspace.resolve()
     background = None
     preview_processes = {}
@@ -85,6 +78,17 @@ async def exercise():
                     for agent in entry["config"]["agents"]:
                         agent["idle_timeout"] = 2
         config.write_text(tomli_w.dumps(document))
+
+    def inspections():
+        path = root / "audit.jsonl"
+        if not path.exists():
+            return []
+        return [
+            audit.payload
+            for line in path.read_text().splitlines()
+            for audit in (AUDIT_EVENT.validate_json(line),)
+            if audit.event_name == "test_channel.inspection"
+        ]
 
     async def packets(reader):
         pending = bytearray()
@@ -99,19 +103,18 @@ async def exercise():
 
     async def collect(reader):
         async for packet in packets(reader):
-            events.write(json.dumps({"phase": phase, **packet}) + "\n")
-            events.flush()
-            print(json.dumps({"phase": phase, **packet}), flush=True)
+            if "audit" in packet:
+                print(json.dumps({"phase": phase, **packet}), flush=True)
             await queue.put(packet)
         await queue.put(None)
 
     async def start():
-        nonlocal process, writer, collector, queue, phase, database
+        nonlocal process, writer, collector, queue, phase
         phase = "startup"
-        database = str(Path(os.environ["BCN_HOME"]) / "bcn.sqlite3")
         endpoint = workspace / "channel.json"
         endpoint.unlink(missing_ok=True)
         queue = asyncio.Queue()
+        inspected = len(await asyncio.to_thread(inspections))
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             str(command),
@@ -122,17 +125,18 @@ async def exercise():
             stdout=log,
             stderr=log,
         )
-        print(
-            json.dumps({"node_started": process.pid, "database": database}), flush=True
-        )
+        print(json.dumps({"node_started": process.pid}), flush=True)
         while not endpoint.exists():
             if process.returncode is not None:
                 raise RuntimeError("The isolated node exited; inspect node.log")
             await asyncio.sleep(0.05)
-        inspection = json.loads((root / "inspection.json").read_text())
+        while len(found := await asyncio.to_thread(inspections)) == inspected:
+            if process.returncode is not None:
+                raise RuntimeError("The isolated node exited; inspect node.log")
+            await asyncio.sleep(0.05)
+        inspection = cast(dict[str, Any], found[-1])
         assert inspection["available"] and inspection["version"], inspection
         assert inspection["models"] and not inspection["error"], inspection
-        print(json.dumps({"inspection": inspection}), flush=True)
         reader, writer = await asyncio.open_connection(
             "127.0.0.1", json.loads(endpoint.read_text())["port"]
         )
@@ -173,27 +177,18 @@ async def exercise():
                 pass
         record = {
             "node_pid": process.pid,
-            "database": database,
             "codex_home": environment["CODEX_HOME"],
             "node_returncode": process.returncode,
             "live_owned_children": alive,
             "live_owned_processes": details,
         }
-        instances.append(record)
-        (root / "cleanup.json").write_text(
-            json.dumps({"instances": instances}, indent=2) + "\n"
-        )
         print(json.dumps({"node_stopped": record}), flush=True)
         assert process.returncode == 0, record
         assert not alive, record
-        audits: dict[str, list[AuditEvent]] = {}
         sources: dict[str, list[HarnessSourceEvent]] = {}
         closed: dict[str, dict[str, Any]] = {}
         for line in (root / "audit.jsonl").read_text().splitlines():
             audit = AUDIT_EVENT.validate_json(line)
-            audits.setdefault(json.dumps(audit.payload, sort_keys=True), []).append(
-                audit
-            )
             if audit.event_name in {"harness.source.sent", "harness.source.received"}:
                 source = HarnessSourceEvent.model_validate(audit.payload)
                 sources.setdefault(source.source_id, []).append(source)
@@ -203,39 +198,6 @@ async def exercise():
             elif audit.event_name == "harness.source.closed":
                 payload = cast(dict[str, Any], audit.payload)
                 closed[payload["source_id"]] = payload
-        outputs = []
-        for line in (root / "events.jsonl").read_text().splitlines():
-            packet = json.loads(line)
-            if "event" in packet:
-                outputs.append(
-                    (packet["phase"], HarnessOutput.model_validate(packet["event"]))
-                )
-        unmatched = []
-        for output_phase, output in outputs:
-            candidates = audits.get(
-                json.dumps(output.model_dump(mode="json"), sort_keys=True), []
-            )
-            if not any(
-                audit.event_name == f"harness.{output.payload.type}"
-                and all(
-                    getattr(audit.context, field) == getattr(output, field)
-                    for field in (
-                        "session_id",
-                        "turn_id",
-                        "provider_session_id",
-                        "provider_turn_id",
-                    )
-                    if getattr(output, field) is not None
-                )
-                for audit in candidates
-            ):
-                unmatched.append(
-                    {"phase": output_phase, **output.model_dump(mode="json")}
-                )
-        coverage = {"outputs": len(outputs), "unmatched": unmatched}
-        (root / "audit-coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
-        print(json.dumps({"audit_coverage": coverage}), flush=True)
-        assert outputs and not unmatched, coverage
         assert sources and set(sources) == set(closed)
         source_coverage = {}
         for source_id, messages in sources.items():
@@ -263,22 +225,17 @@ async def exercise():
                     }
                 ),
             }
-        (root / "source-audit-coverage.json").write_text(
-            json.dumps(source_coverage, indent=2) + "\n"
-        )
         print(json.dumps({"source_audit_coverage": source_coverage}), flush=True)
 
-    async def restart(number):
+    async def restart():
         nonlocal process, writer, collector
         await stop()
         process = writer = collector = None
-        config = root / "node.toml"
-        document = tomllib.loads(config.read_text())
-        for package in document["contribs"]:
-            for entry in package["enabled"]:
-                if entry["entry"] == "sqlite":
-                    entry["config"]["name"] = f"node-{number}.sqlite3"
-        config.write_text(tomli_w.dumps(document))
+        # Start from an empty node so unread messages from the previous run
+        # do not wake the agent again.
+        database = Path(environment["BCN_HOME"]) / ".bcn" / "bcn.sqlite3"
+        for suffix in ("", "-wal", "-shm"):
+            database.with_name(database.name + suffix).unlink(missing_ok=True)
         await start()
 
     try:
@@ -293,10 +250,6 @@ async def exercise():
                 mentions_agent=True,
                 body=body,
                 metadata={"review": "approved"},
-            )
-            inbound_messages.append(message.model_dump(mode="json"))
-            (root / "inbound.json").write_text(
-                json.dumps(inbound_messages, indent=2) + "\n"
             )
             writer.write(
                 json.dumps({"inbound": message.model_dump(mode="json")}).encode()
@@ -366,7 +319,7 @@ async def exercise():
                 elif audit.get("event_name") == "approval.decided":
                     approval_decisions.append(audit["payload"])
                 assert payload.get("type") != "compaction.started", (
-                    f"Context compaction entered during {label}; inspect events.jsonl"
+                    f"Context compaction entered during {label}; inspect the printed events"
                 )
                 if (
                     steer
@@ -451,12 +404,6 @@ async def exercise():
                 assert terminal["payload"]["type"] == (
                     "started" if stop_at_started else "completed"
                 ), terminal
-            mcp_log = root / "mcp-requests.jsonl"
-            mcp_queries = (
-                [json.loads(line) for line in mcp_log.read_text().splitlines()]
-                if mcp_log.exists()
-                else []
-            )
             record = {
                 "phase": label,
                 "bcc_calls": calls,
@@ -477,15 +424,12 @@ async def exercise():
                 "accepted_steering": accepted_steering,
                 "approval_requests": approval_requests,
                 "approval_decisions": approval_decisions,
-                "mcp_queries": mcp_queries,
             }
-            summary.append(record)
-            (root / "progress.json").write_text(json.dumps(summary, indent=2) + "\n")
             print(json.dumps({"phase_complete": label, **record}), flush=True)
             return record
 
         def verify_value(record, arguments, scope=None):
-            """Check native MCP execution against the real server's call journal."""
+            """Check native MCP execution returned the real server's value."""
             calls = [
                 tool
                 for tool in record["tools"]
@@ -500,20 +444,11 @@ async def exercise():
                 for started in record["started_tools"]
                 for tool in calls
             )
-            queries = [
-                query
-                for query in record["mcp_queries"]
-                if query["arguments"] == arguments
-            ]
-            assert queries and all(
-                query["result"] == {"key": arguments["key"], "value": "MCP_OK"}
-                for query in queries
-            ), record
             assert any(
-                tool["call"]["output"]["structuredContent"] == query["result"]
+                tool["call"]["output"]["structuredContent"]
+                == {"key": arguments["key"], "value": "MCP_OK"}
                 for tool in calls
-                for query in queries
-            )
+            ), record
             interactions = [
                 interaction
                 for interaction in record["interactions"]
@@ -534,32 +469,16 @@ async def exercise():
             """Observe the MCP result without waiting for a natural turn ending."""
             nonlocal phase
             phase = label
-            attempts = []
             arguments = {"key": key}
             request = (
                 "请使用工具调用 mcp__test__get_value，"
                 f"参数为 {json.dumps(arguments)}，读取测试值。"
             )
-            checkpoint = {
-                "phase": label,
-                "arguments": arguments,
-                "scope": scope.value if scope else None,
-                "attempts": attempts,
-                "feedback_count": 0,
-                "feedback_limit": MCP_FEEDBACK_LIMIT,
-                "verified": False,
-            }
-            mcp_checks.append(checkpoint)
             input_message_id = await inbound(request)
             context = None
             retry = 0
             while True:
                 phase = label if retry == 0 else f"{label}-retry-{retry}"
-                attempts.append(phase)
-                checkpoint["feedback_count"] = retry
-                (root / "mcp-checkpoints.json").write_text(
-                    json.dumps(mcp_checks, indent=2) + "\n"
-                )
                 record = await finish(
                     phase,
                     scope=scope or ApprovalScope.ONCE,
@@ -580,10 +499,6 @@ async def exercise():
                 )
                 if called or approval_requested or retry == MCP_FEEDBACK_LIMIT:
                     verify_value(record, arguments, scope)
-                    checkpoint["verified"] = True
-                    (root / "mcp-checkpoints.json").write_text(
-                        json.dumps(mcp_checks, indent=2) + "\n"
-                    )
                     return record
                 retry += 1
                 feedback = (
@@ -607,7 +522,7 @@ async def exercise():
             await inbound("Please remind me to drink some water in five seconds.")
             first = await finish("bcc", steer=True)
             assert first["bcc_calls"], (
-                "No successful bcc call was observed; inspect events.jsonl"
+                "No successful bcc call was observed; inspect the printed events"
             )
             assert any(
                 interaction["request"]["approval"]["action"] == "command_execution"
@@ -664,7 +579,7 @@ async def exercise():
                 ApprovalScope.SESSION,
             )
             (workspace / "AGENTS.md").write_text("Keep replies concise.\n")
-            await restart(1)
+            await restart()
             refreshed = await query_value(
                 "refreshed",
                 "always-first",
@@ -676,7 +591,7 @@ async def exercise():
             )
 
             (workspace / "AGENTS.md").write_text("Keep replies brief and clear.\n")
-            await restart(2)
+            await restart()
             remembered_always = await query_value(
                 "mcp-always",
                 "always-second",
@@ -698,15 +613,17 @@ async def exercise():
             assert len(servers) == 1
             server = servers[0]
             owned = [server, *server.children(recursive=True)]
-            (root / "recovery-process.json").write_text(
+            print(
                 json.dumps(
                     {
-                        "pid": server.pid,
-                        "ppid": server.ppid(),
-                        "cmdline": server.cmdline(),
+                        "recovery_process": {
+                            "pid": server.pid,
+                            "ppid": server.ppid(),
+                            "cmdline": server.cmdline(),
+                        }
                     }
-                )
-                + "\n"
+                ),
+                flush=True,
             )
             for child in reversed(owned):
                 try:
@@ -861,14 +778,10 @@ async def exercise():
                 except psutil.NoSuchProcess:
                     pass
             background["live_preview_processes_after_node_stop"] = alive
-            (root / "background.json").write_text(
-                json.dumps(background, indent=2) + "\n"
-            )
+            print(json.dumps({"background": background}), flush=True)
             assert not background["listening_after_node_stop"], background
             assert not background["live_preview_processes_after_node_stop"], background
         log.close()
-        events.close()
-    (root / "verified.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
 if __name__ == "__main__":

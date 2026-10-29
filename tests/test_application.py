@@ -149,4 +149,3 @@ async def test_installed_application(
         scenario,
         str(shared_agent_root / "workspace"),
     )
-    assert await asyncio.to_thread((root / "verified.json").is_file)

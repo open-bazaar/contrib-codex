@@ -16,7 +16,7 @@ from typing import Any, ClassVar, Literal, cast
 from uuid import NAMESPACE_URL, uuid5, uuid7
 
 import aiofiles
-from bazaar_contrib_audit import AUDIT_EVENT, AuditEvent
+from bazaar_contrib_audit import AUDIT, AUDIT_EVENT, AuditContext, AuditEvent
 from bazaar_contrib_channel import (
     CHANNEL,
     CHANNEL_BUILDERS,
@@ -52,7 +52,7 @@ class ChannelConfig(BaseModel):
     kind: ClassVar[str] = "test-channel"
     model_config = ConfigDict(extra="forbid", frozen=True)
     endpoint_file: str = "channel.json"
-    inspection_file: Path
+    audit_file: Path
 
 
 class AuditJournal:
@@ -350,15 +350,15 @@ def record(ctx: Context, event: AuditEvent):
 @asynccontextmanager
 async def channel_lifespan(ctx: Context, config: ChannelConfig):
     input = ctx.accept(CHANNEL_INPUT)
-    ctx.accept(JOURNAL).paths[input.agent_id] = config.inspection_file.with_name(
-        "audit.jsonl"
-    )
+    ctx.accept(JOURNAL).paths[input.agent_id] = config.audit_file
     async with timer_timeout(ctx.accept(TIMER), 30_000):
         inspection = await ctx.accept(harness_builder_key("codex")).inspect(
             input.workspace, timeout=30
         )
-    await asyncio.to_thread(
-        config.inspection_file.write_text, inspection.model_dump_json(indent=2) + "\n"
+    await ctx.accept(AUDIT).publish(
+        "test_channel.inspection",
+        context=AuditContext(agent_id=input.agent_id, channel=config.kind),
+        payload=inspection.model_dump(mode="json"),
     )
     async with asyncio.TaskGroup() as group:
         channel = TestChannel(input, group, config.kind, ctx.accept(TIMER))
@@ -395,7 +395,7 @@ async def channel_lifespan(ctx: Context, config: ChannelConfig):
 
 channel = Contrib(
     config=ChannelConfig,
-    accepts=[CHANNEL_INPUT, TIMER, harness_builder_key("codex"), JOURNAL],
+    accepts=[CHANNEL_INPUT, TIMER, harness_builder_key("codex"), JOURNAL, AUDIT],
     offers=[CHANNEL],
     lifespan=channel_lifespan,
     listen={AUDIT_EVENT: record},

@@ -118,18 +118,7 @@ jobs:
             .artifacts/e2e/**/bootstrap.log
             .artifacts/e2e/**/activation.log
             .artifacts/e2e/**/node.log
-            .artifacts/e2e/**/events.jsonl
-            .artifacts/e2e/**/verified.json
-            .artifacts/e2e/**/cleanup.json
-            .artifacts/e2e/**/inbound.json
-            .artifacts/e2e/**/inspection.json
-            .artifacts/e2e/**/progress.json
-            .artifacts/e2e/**/mcp-checkpoints.json
-            .artifacts/e2e/**/recovery-process.json
-            .artifacts/e2e/**/background.log
-            .artifacts/e2e/**/background.json
-            .artifacts/e2e/**/background.events.jsonl
+            .artifacts/e2e/**/audit.jsonl
             .artifacts/e2e/**/full-access-note.txt
-            .artifacts/e2e/**/mcp-requests.jsonl
           include-hidden-files: true
           if-no-files-found: warn

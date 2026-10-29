@@ -59,9 +59,7 @@ agents = [
         "name": "Assistant",
         "workspace": str(workspace),
         "mode": "session",
-        "channel": [
-            {"kind": "test-channel", "inspection_file": str(root / "inspection.json")}
-        ],
+        "channel": [{"kind": "test-channel", "audit_file": str(root / "audit.jsonl")}],
         "harness": [{"kind": "codex", "model": model}],
     }
 ]
@@ -83,7 +81,7 @@ codex = {
     "mcp_servers": {
         "test": {
             "command": str(python),
-            "args": ["-m", "bcn_codex_test_channel.mcp", str(root)],
+            "args": ["-m", "bcn_codex_test_channel.mcp"],
             "default_tools_approval_mode": "auto",
             "required": True,
         }
@@ -112,8 +110,6 @@ for package in document["contribs"]:
     for entry in package["enabled"]:
         if entry["entry"] == "agent":
             entry["config"]["agents"] = agents
-        elif entry["entry"] == "sqlite":
-            entry["config"] = {"name": "node.sqlite3"}
         elif entry["entry"] in {"sidecar-unix", "sidecar-windows"}:
             entry["config"] = {"endpoint": endpoint}
 document["contribs"] = [
