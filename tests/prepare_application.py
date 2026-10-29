@@ -113,7 +113,7 @@ for package in document["contribs"]:
         if entry["entry"] == "agent":
             entry["config"]["agents"] = agents
         elif entry["entry"] == "sqlite":
-            entry["config"] = {"path": str(root / "node.sqlite3")}
+            entry["config"] = {"name": "node.sqlite3"}
         elif entry["entry"] in {"sidecar-unix", "sidecar-windows"}:
             entry["config"] = {"endpoint": endpoint}
 document["contribs"] = [

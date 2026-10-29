@@ -108,13 +108,7 @@ async def exercise():
     async def start():
         nonlocal process, writer, collector, queue, phase, database
         phase = "startup"
-        document = tomllib.loads((root / "node.toml").read_text())
-        database = next(
-            entry["config"]["path"]
-            for package in document["contribs"]
-            for entry in package["enabled"]
-            if entry["entry"] == "sqlite"
-        )
+        database = str(Path(os.environ["BCN_HOME"]) / "bcn.sqlite3")
         endpoint = workspace / "channel.json"
         endpoint.unlink(missing_ok=True)
         queue = asyncio.Queue()
@@ -283,7 +277,7 @@ async def exercise():
         for package in document["contribs"]:
             for entry in package["enabled"]:
                 if entry["entry"] == "sqlite":
-                    entry["config"]["path"] = str(root / f"node-{number}.sqlite3")
+                    entry["config"]["name"] = f"node-{number}.sqlite3"
         config.write_text(tomli_w.dumps(document))
         await start()
 

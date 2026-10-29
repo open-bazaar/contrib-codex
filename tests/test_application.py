@@ -114,7 +114,9 @@ async def test_installed_application(
         "--refresh",
         "--default-index",
         "https://pypi.org/simple",
-        "bazaar-compute-node>=0.3.0rc7,<0.4",
+        "bazaar-compute-node>=0.3.0rc9,<0.4",
+        "--with",
+        "psutil>=7.0.0",
     ]
     for wheel in wheels:
         arguments.extend(["--with", str(wheel)])

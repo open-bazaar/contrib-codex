@@ -7,10 +7,10 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-    "bazaar-core~=0.3.0rc6",
-    "bazaar-contrib-harness~=0.3.0rc6",
-    "bazaar-contrib-audit~=0.3.0rc6",
-    "bazaar-contrib-timer~=0.3.0rc7",
+    "bazaar-core~=0.3.0rc9",
+    "bazaar-contrib-harness~=0.3.0rc9",
+    "bazaar-contrib-audit~=0.3.0rc9",
+    "bazaar-contrib-timer~=0.3.0rc9",
     "pydantic>=2.12.0",
     "psutil>=7.0.0",
 ]
@@ -26,7 +26,7 @@ requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = ["bazaar-compute-node>=0.3.0rc7,<0.4", "bcn-codex-test-channel", "blockbuster>=1.5.29,<1.6", "ruff>=0.9.0", "pyright==1.1.414", "pytest>=8.3.0", "pytest-asyncio>=0.24.0", "tomli-w>=1.2.0"]
+dev = ["bazaar-compute-node>=0.3.0rc9,<0.4", "bcn-codex-test-channel", "blockbuster>=1.5.29,<1.6", "ruff>=0.9.0", "pyright==1.1.414", "pytest>=8.3.0", "pytest-asyncio>=0.24.0", "tomli-w>=1.2.0"]
 
 [tool.uv.sources]
 bcn-codex-test-channel = { path = "tests/fixtures/channel", editable = true }
