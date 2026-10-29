@@ -1,6 +1,6 @@
 // Warm one real, model-visible prefix before forwarding the acceptance traffic.
 import http from 'node:http';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { Transform } from 'node:stream';
 
@@ -64,9 +64,25 @@ async function preheat(body, requestId) {
   while (length < actual.length && length < boundary.length && actual[length] === boundary[length]) length++;
   if (!length) throw new Error('No model-token prefix is available for preheat');
   const prefix = actual.slice(0, length);
+  const prefixHash = sha256(JSON.stringify(prefix));
+  const identity = JSON.parse(readFileSync('/evidence/cache-identity.json', 'utf8'));
+  const key = sha256(JSON.stringify({ identity, prefix_sha256: prefixHash }));
+  const entry = existsSync('/cache/entry.json')
+    ? JSON.parse(readFileSync('/cache/entry.json', 'utf8')) : undefined;
+  if (entry?.key === key) {
+    const started = performance.now();
+    const restored = await post('/slots/0?action=restore', { filename: 'prefix.bin' });
+    const cache = {
+      key, created: false, prefix_tokens: length, prefix_sha256: prefixHash,
+      elapsed_seconds: (performance.now() - started) / 1000, ...restored,
+    };
+    record({ kind: 'cache.restored', ...cache });
+    writeFileSync('/evidence/cache.json', JSON.stringify(cache), { mode: 0o600 });
+    return;
+  }
   record({
     kind: 'warmup.start', request_id: requestId, prefix_tokens: length,
-    first_request_tokens: actual.length, prefix_sha256: sha256(JSON.stringify(prefix)),
+    first_request_tokens: actual.length, prefix_sha256: prefixHash,
     tool_count: body.tools?.length ?? 0, n_predict: 1,
   });
   const started = performance.now();
@@ -81,6 +97,13 @@ async function preheat(body, requestId) {
     tokens_evaluated: result.tokens_evaluated, tokens_predicted: result.tokens_predicted,
     discarded_output_characters: result.content?.length ?? 0,
   });
+  const saved = await post('/slots/0?action=save', { filename: 'prefix.bin' });
+  const cache = {
+    key, created: true, prefix_tokens: length, prefix_sha256: prefixHash, ...saved,
+  };
+  writeFileSync('/cache/entry.json', JSON.stringify({ key }), { mode: 0o600 });
+  writeFileSync('/evidence/cache.json', JSON.stringify(cache), { mode: 0o600 });
+  record({ kind: 'cache.saved', ...cache });
 }
 
 function forward(request, response, bytes, entry) {

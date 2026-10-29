@@ -11,8 +11,15 @@ from math import ceil
 from pathlib import Path
 from typing import Any
 
+from bazaar_contrib_audit import Audit, AuditContext
 from bazaar_contrib_harness import (
     ApprovalHandler,
+    ContentDelta,
+    ContentDeltaKind,
+    ContextCompactionCompleted,
+    ContextCompactionStarted,
+    FileChangeEntry,
+    HarnessEventPayload,
     HarnessExpire,
     HarnessFailure,
     HarnessFailureReason,
@@ -26,12 +33,26 @@ from bazaar_contrib_harness import (
     ProviderCallStatus,
     SandboxPolicy,
     SessionInput,
+    TokenUsage,
+    ToolCall,
+    ToolCallCompleted,
+    ToolCallDeltaKind,
+    ToolCallFailed,
+    ToolCallInteraction,
+    ToolCallPatchUpdated,
+    ToolCallStarted,
+    ToolCallTextDelta,
+    TurnCompleted,
+    TurnFailed,
+    TurnStarted,
+    UsageUpdated,
 )
 from bazaar_contrib_timer import Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from .approval import decline, interact
+from .source import SourceAudit
 from .transport import AppServer, AppServerError, AppServerUnavailable, Packet, failure
 
 logger = logging.getLogger(__name__)
@@ -41,9 +62,29 @@ SANDBOX_POLICIES = {
     SandboxPolicy.DANGER_FULL_ACCESS: "danger-full-access",
 }
 
+_TOOL_TYPE_NAMES = {
+    "commandExecution": "command",
+    "fileChange": "file_change",
+    "mcpToolCall": "mcp_tool",
+    "dynamicToolCall": "dynamic_tool",
+    "collabAgentToolCall": "agent",
+    "subAgentActivity": "agent",
+    "webSearch": "web_search",
+    "imageView": "image_view",
+    "imageGeneration": "image_generation",
+    "sleep": "sleep",
+    "functionCallOutput": "function",
+}
+
+_JSON_VALUE_ADAPTER = TypeAdapter[JsonValue](JsonValue)
+
 
 class FsWatchResponse(BaseModel):
     path: Path
+
+
+class BackgroundTerminalsResponse(BaseModel):
+    data: list[dict[str, Any]]
 
 
 def turn_failure(
@@ -57,10 +98,7 @@ def turn_failure(
             return None
         case "failed":
             reason = HarnessFailureReason.EXECUTION
-            message = error.get("message") or "Codex execution failed"
-        case "interrupted":
-            reason = HarnessFailureReason.INTERRUPTED
-            message = error.get("message") or "Codex execution was interrupted"
+            message = error.get("message") or "provider_failed"
         case _:
             reason = HarnessFailureReason.PROTOCOL
             message = f"Unsupported Codex turn status: {turn['status']}"
@@ -89,26 +127,16 @@ class TurnStream:
         self.timeout = timeout
         self.provider_turn_id: str | None = None
         self.finished = False
+        self.initial_error: Exception | None = None
 
     def __aiter__(self) -> TurnStream:
         return self
 
-    def output(
-        self,
-        kind: str,
-        packet: Packet,
-        *,
-        text: str = "",
-        failure: HarnessFailure | None = None,
-        **metadata: Any,
-    ) -> HarnessOutput:
+    def output(self, payload: HarnessEventPayload, packet: Packet) -> HarnessOutput:
         return HarnessOutput(
             session_id=self.turn.session_id,
             turn_id=self.turn.id,
-            kind=kind,
-            text=text,
-            failure=failure,
-            metadata=metadata,
+            payload=payload,
             provider="codex",
             provider_event=packet.method,
             provider_session_id=self.connection.session.provider_thread_id,
@@ -125,6 +153,20 @@ class TurnStream:
         if self.finished:
             raise StopAsyncIteration
         try:
+            if self.initial_error is not None:
+                error = self.initial_error
+                self.finished = True
+                return HarnessOutput(
+                    session_id=self.turn.session_id,
+                    turn_id=self.turn.id,
+                    payload=TurnFailed(
+                        event_name="codex.turn.start.unknown",
+                        failure=failure(error, needs_reconciliation=True),
+                    ),
+                    provider="codex",
+                    provider_event="turn/start",
+                    provider_session_id=self.connection.session.provider_thread_id,
+                )
             while True:
                 packet = await self.connection.server.events.get()
                 if isinstance(packet, Exception):
@@ -148,33 +190,62 @@ class TurnStream:
                     )
                 match packet.method:
                     case "turn/started":
-                        return self.output("started", packet)
+                        return self.output(
+                            TurnStarted(event_name="codex.turn.started"), packet
+                        )
                     case "turn/completed":
-                        status = params["turn"]["status"]
                         self.finished = True
-                        error = params["turn"].get("error")
                         terminal = turn_failure(
                             params["turn"], needs_reconciliation=True
                         )
+                        metadata = {
+                            "status": params["turn"]["status"],
+                            "error": params["turn"].get("error"),
+                        }
                         return self.output(
-                            "completed" if terminal is None else "failed",
+                            TurnCompleted(
+                                event_name="codex.turn.completed", metadata=metadata
+                            )
+                            if terminal is None
+                            else TurnFailed(
+                                event_name="codex.turn.failed",
+                                failure=terminal,
+                                metadata=metadata,
+                            ),
                             packet,
-                            text=terminal.message if terminal else "",
-                            failure=terminal,
-                            status=status,
-                            error=error,
                         )
-                    case "item/agentMessage/delta":
+                    case (
+                        "item/agentMessage/delta"
+                        | "item/plan/delta"
+                        | "item/reasoning/summaryTextDelta"
+                        | "item/reasoning/textDelta"
+                    ):
+                        kind, index = {
+                            "item/agentMessage/delta": (
+                                ContentDeltaKind.AGENT_MESSAGE,
+                                None,
+                            ),
+                            "item/plan/delta": (ContentDeltaKind.PLAN, None),
+                            "item/reasoning/summaryTextDelta": (
+                                ContentDeltaKind.REASONING_SUMMARY,
+                                params.get("summaryIndex"),
+                            ),
+                            "item/reasoning/textDelta": (
+                                ContentDeltaKind.REASONING_TEXT,
+                                params.get("contentIndex"),
+                            ),
+                        }[packet.method]
                         return self.output(
-                            "text",
+                            ContentDelta(
+                                kind=kind,
+                                text=params["delta"],
+                                index=index
+                                if isinstance(index, int)
+                                and not isinstance(index, bool)
+                                else None,
+                            ),
                             packet,
-                            text=params["delta"],
-                            item_id=params["itemId"],
                         )
-                    case "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta":
-                        return self.output("reasoning", packet, text=params["delta"])
-                    case "item/plan/delta":
-                        return self.output("plan", packet, text=params["delta"])
                     case "item/started" | "item/completed":
                         item = params["item"]
                         if item["type"] in {
@@ -187,94 +258,205 @@ class TurnStream:
                             "exitedReviewMode",
                         }:
                             continue
+                        if not isinstance(item.get("id"), str) or not item["id"]:
+                            continue
+                        timestamp = (
+                            "startedAtMs"
+                            if packet.method == "item/started"
+                            else "completedAtMs"
+                        )
+                        if not isinstance(params.get(timestamp), int) or isinstance(
+                            params[timestamp], bool
+                        ):
+                            raise AppServerError(
+                                f"item lifecycle requires {timestamp}",
+                                reason=HarnessFailureReason.PROTOCOL,
+                            )
                         if item["type"] == "contextCompaction":
                             return self.output(
-                                "compaction.started"
+                                ContextCompactionStarted(compaction_id=item["id"])
                                 if packet.method == "item/started"
-                                else "compaction.completed",
+                                else ContextCompactionCompleted(
+                                    compaction_id=item["id"]
+                                ),
                                 packet,
-                                item=item,
                             )
-                        kind = (
-                            "tool.started"
-                            if packet.method == "item/started"
-                            else "tool.completed"
+                        name = item.get("tool") or item.get("name")
+                        if item.get("server") and item.get("tool"):
+                            name = f"{item['server']}/{item['tool']}"
+                        if not name and item.get("command"):
+                            parts = item["command"].strip().split(maxsplit=1)
+                            name = parts[0] if parts else None
+                        name = name or _TOOL_TYPE_NAMES.get(item["type"], "tool")
+                        started = packet.method == "item/started"
+                        fields = (
+                            ("arguments", "input", "command")
+                            if started
+                            else ("result", "output", "contentItems")
                         )
-                        if packet.method == "item/completed" and (
+                        field = next((field for field in fields if field in item), None)
+                        try:
+                            value = (
+                                None
+                                if field is None
+                                else _JSON_VALUE_ADAPTER.validate_python(
+                                    item[field], strict=True
+                                )
+                            )
+                        except ValidationError as error:
+                            raise AppServerError(
+                                f"item lifecycle {field} must be a JSON value",
+                                reason=HarnessFailureReason.PROTOCOL,
+                            ) from error
+                        call = ToolCall(
+                            call_id=item["id"],
+                            name=name,
+                            input=value if started else None,
+                            output=None if started else value,
+                        )
+                        error = item.get("error")
+                        if started:
+                            payload = ToolCallStarted(call=call)
+                        elif (
                             item.get("status") in {"failed", "declined", "errored"}
-                            or item.get("error") is not None
+                            or error is not None
                         ):
-                            kind = "tool.failed"
-                        return self.output(kind, packet, item=item)
-                    case "item/commandExecution/outputDelta":
+                            payload = ToolCallFailed(
+                                call=call,
+                                error_message=(
+                                    error.get("message")
+                                    if isinstance(error, dict)
+                                    else error
+                                )
+                                if isinstance(error, (dict, str))
+                                else None,
+                            )
+                        else:
+                            payload = ToolCallCompleted(call=call)
+                        return self.output(payload, packet)
+                    case "item/fileChange/patchUpdated":
+                        for change in params["changes"]:
+                            if (
+                                not isinstance(change["path"], str)
+                                or not change["path"]
+                                or not isinstance(change["diff"], str)
+                                or change["kind"]["type"]
+                                not in {"add", "delete", "update"}
+                            ):
+                                raise AppServerError(
+                                    "Invalid Codex file change patch",
+                                    reason=HarnessFailureReason.PROTOCOL,
+                                )
                         return self.output(
-                            "tool.output",
+                            ToolCallPatchUpdated(
+                                call_id=params["itemId"],
+                                changes=tuple(
+                                    FileChangeEntry(
+                                        path=change["path"],
+                                        kind=change["kind"]["type"],
+                                        patch=change["diff"],
+                                    )
+                                    for change in params["changes"]
+                                ),
+                            ),
                             packet,
-                            text=params["delta"],
-                            item_id=params["itemId"],
                         )
-                    case "item/fileChange/outputDelta" | "item/fileChange/patchUpdated":
-                        return self.output("tool.patch", packet, **params)
                     case "item/commandExecution/terminalInteraction":
-                        return self.output("tool.interaction", packet, **params)
+                        return self.output(
+                            ToolCallInteraction(
+                                call_id=params["itemId"],
+                                stdin=params["stdin"],
+                                process_id=params.get("processId"),
+                            ),
+                            packet,
+                        )
                     case "thread/tokenUsage/updated":
                         usage = params["tokenUsage"]
-                        metadata = {}
-                        for key in ("total", "last"):
-                            value = usage[key]
-                            metadata[key] = {
-                                "input_tokens": max(
+                        tokens = {
+                            key: TokenUsage(
+                                input_tokens=max(
                                     0, value["inputTokens"] - value["cachedInputTokens"]
                                 ),
-                                "cached_input_tokens": value["cachedInputTokens"],
-                                "cache_write_input_tokens": value.get(
+                                cached_input_tokens=value["cachedInputTokens"],
+                                cache_write_input_tokens=value.get(
                                     "cacheWriteInputTokens"
                                 ),
-                                "output_tokens": value["outputTokens"],
-                                "reasoning_output_tokens": value.get(
+                                output_tokens=value["outputTokens"],
+                                reasoning_output_tokens=value.get(
                                     "reasoningOutputTokens"
                                 ),
-                                "total_tokens": value["totalTokens"],
-                            }
+                                total_tokens=value["totalTokens"],
+                            )
+                            for key in ("total", "last")
+                            for value in (usage[key],)
+                        }
                         return self.output(
-                            "usage",
+                            UsageUpdated(
+                                total=tokens["total"],
+                                last=tokens["last"],
+                                model_context_window=usage.get("modelContextWindow"),
+                            ),
                             packet,
-                            **metadata,
-                            model_context_window=usage.get("modelContextWindow"),
                         )
                     case "error":
+                        if not isinstance(params["willRetry"], bool):
+                            raise AppServerError(
+                                "params.willRetry must be a bool",
+                                reason=HarnessFailureReason.PROTOCOL,
+                            )
+                        metadata: dict[str, JsonValue] = {
+                            "will_retry": params["willRetry"]
+                        }
+                        info = params["error"].get("codexErrorInfo")
+                        if isinstance(info, dict):
+                            if len(info) != 1:
+                                raise AppServerError(
+                                    "codexErrorInfo must contain one error type",
+                                    reason=HarnessFailureReason.PROTOCOL,
+                                )
+                            info = next(iter(info))
+                        if info is not None:
+                            metadata["provider_error_type"] = info
                         return self.output(
-                            "provider.retry"
-                            if params.get("willRetry", False)
-                            else "provider.error",
+                            TurnStarted(
+                                event_name="codex.turn.error", metadata=metadata
+                            ),
                             packet,
-                            text=params["error"]["message"],
-                            **params,
                         )
                     case _:
                         if packet.method and packet.method.startswith("item/"):
                             suffix = packet.method.rsplit("/", 1)[-1]
                             if suffix in {"progress", "outputDelta"}:
                                 return self.output(
-                                    "tool.progress"
-                                    if suffix == "progress"
-                                    else "tool.output",
+                                    ToolCallTextDelta(
+                                        call_id=params["itemId"],
+                                        kind=ToolCallDeltaKind.PROGRESS
+                                        if suffix == "progress"
+                                        else ToolCallDeltaKind.OUTPUT,
+                                        text=params["message"]
+                                        if suffix == "progress"
+                                        else params["delta"],
+                                    ),
                                     packet,
-                                    text=params.get("message")
-                                    or params.get("delta", ""),
-                                    item_id=params.get("itemId"),
                                 )
                         continue
         except Exception as error:  # noqa: BLE001 -- Report native stream failures.
             self.finished = True
+            protocol = isinstance(error, (KeyError, TypeError, ValueError)) or (
+                isinstance(error, AppServerError)
+                and not isinstance(error, AppServerUnavailable)
+            )
             if isinstance(error, (KeyError, TypeError, ValueError)):
                 error = AppServerError(str(error), reason=HarnessFailureReason.PROTOCOL)
             return HarnessOutput(
                 session_id=self.turn.session_id,
                 turn_id=self.turn.id,
-                kind="failed",
-                text=str(error),
-                failure=failure(error, needs_reconciliation=True),
+                payload=TurnFailed(
+                    event_name="codex.turn.protocol.unknown"
+                    if protocol
+                    else "codex.turn.transport.unknown",
+                    failure=failure(error, needs_reconciliation=True),
+                ),
                 provider="codex",
                 provider_session_id=self.connection.session.provider_thread_id,
                 provider_turn_id=self.provider_turn_id,
@@ -313,22 +495,45 @@ class Connection:
         self.home: Path | None = None
 
     async def open(self, *, timeout: float):
-        try:
-            self.server = await AppServer.start(
-                self.request.workspace,
-                self.request.environment,
-                self.answer,
-                self.notify,
-                timer=self.owner.timer,
-                timeout=timeout,
+        for attempt in range(2):
+            self.source = SourceAudit(
+                self.owner.audit,
+                AuditContext(
+                    agent_id=self.owner.input.agent_id,
+                    harness="codex",
+                    session_id=self.request.id,
+                    provider_session_id=self.session.provider_thread_id,
+                ),
             )
-            result = await self.server.initialize()
-            self.home = Path(result["codexHome"])
-            await self.watch()
-        except BaseException:
-            if hasattr(self, "server"):
-                self.owner.close(self)
-            raise
+            async with timer_timeout(
+                self.owner.timer, ceil(self.owner.input.startup_timeout * 1000)
+            ):
+                self.server = await AppServer.start(
+                    self.request.workspace,
+                    self.request.environment,
+                    self.answer,
+                    self.notify,
+                    timer=self.owner.timer,
+                    timeout=timeout,
+                    source=self.source,
+                )
+            try:
+                async with timer_timeout(
+                    self.owner.timer, ceil(self.owner.input.startup_timeout * 1000)
+                ):
+                    result = await self.server.initialize()
+                self.home = Path(result["codexHome"])
+                await self.watch()
+                return
+            except BaseException as error:
+                if hasattr(self, "server"):
+                    self.owner.close(self, timeout=timeout)
+                if not isinstance(error, TimeoutError) or attempt == 1:
+                    raise
+                logger.warning(
+                    "Retrying Codex initialization for session %s after a timeout",
+                    self.session.id,
+                )
 
     async def answer(self, packet: Packet) -> dict[str, Any]:
         stream = self.stream
@@ -373,15 +578,18 @@ class Connection:
             "codex-home": self.home / "AGENTS.md",
         }
         for id, path in self.watch_targets.items():
-            result = FsWatchResponse.model_validate(
-                await self.server.request(
-                    "fs/watch",
-                    {
-                        "watchId": id,
-                        "path": str(path),
-                    },
+            async with timer_timeout(
+                self.owner.timer, ceil(self.owner.input.startup_timeout * 1000)
+            ):
+                result = FsWatchResponse.model_validate(
+                    await self.server.request(
+                        "fs/watch",
+                        {
+                            "watchId": id,
+                            "path": str(path),
+                        },
+                    )
                 )
-            )
             if result.path != path:
                 raise AppServerError(
                     "fs/watch returned a different path",
@@ -394,11 +602,13 @@ class CodexHarness:
         self,
         input: HarnessInput,
         timer: Timer,
+        audit: Audit,
         model: str | None,
         effort: str | None,
     ):
         self.input = input
         self.timer = timer
+        self.audit = audit
         self.model = model
         self.effort = effort
         self.connections: dict[str, Connection] = {}
@@ -407,8 +617,8 @@ class CodexHarness:
         self.events: asyncio.Queue[HarnessExpire] = asyncio.Queue()
         self.closing: set[asyncio.Task[None]] = set()
 
-    def close(self, connection: Connection) -> asyncio.Task[None]:
-        task = connection.server.close(timeout=self.input.shutdown_timeout)
+    def close(self, connection: Connection, *, timeout: float) -> asyncio.Task[None]:
+        task = connection.server.close(timeout=timeout)
         self.closing.add(task)
         task.add_done_callback(self.closing.discard)
         return task
@@ -425,13 +635,11 @@ class CodexHarness:
         self.sessions[request.id] = request
         previous = self.connections.pop(request.id, None)
         if previous is not None:
-            self.close(previous)
+            self.close(previous, timeout=timeout)
         connection = Connection(self, request)
         try:
-            async with timer_timeout(
-                self.timer, ceil(min(timeout, self.input.startup_timeout) * 1000)
-            ):
-                await connection.open(timeout=timeout)
+            await connection.open(timeout=timeout)
+            async with timer_timeout(self.timer, ceil(timeout * 1000)):
                 result = await connection.server.request(
                     "thread/start",
                     {
@@ -451,7 +659,7 @@ class CodexHarness:
             )
         except BaseException as error:
             if hasattr(connection, "server"):
-                self.close(connection)
+                self.close(connection, timeout=timeout)
             if isinstance(
                 error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
             ):
@@ -475,12 +683,17 @@ class CodexHarness:
         timeout: float,
     ) -> TurnStream:
         connection = self.connections.get(session.id)
-        if connection is None or connection.server.process.returncode is not None:
+        if (
+            connection is None
+            or connection.server.closed
+            or connection.server.process.returncode is not None
+        ):
             raise HarnessSessionUnavailable("The session's Codex app-server has exited")
         if connection.stream is not None and not connection.stream.finished:
             raise RuntimeError("The Codex session already owns an active turn")
         stream = TurnStream(connection, turn, approval_handler, timeout)
         connection.stream = stream
+        connection.source.turn_id = turn.id
         self.turns.pop(session.id, None)
         inputs = [{"type": "text", "text": turn.input_text}]
         for attachment in turn.attachments:
@@ -515,6 +728,15 @@ class CodexHarness:
                 )
                 stream.provider_turn_id = result["turn"]["id"]
                 self.turns[session.id] = (turn.id, result["turn"]["id"])
+        except asyncio.CancelledError:
+            # The request may already have reached Codex without returning its
+            # turn ID. Retire the process so an unowned turn cannot keep running;
+            # the retained session input/thread can be resumed by reconciliation.
+            stream.finished = True
+            connection.stream = None
+            self.connections.pop(session.id, None)
+            self.close(connection, timeout=timeout)
+            raise
         except (
             AppServerError,
             OSError,
@@ -523,7 +745,7 @@ class CodexHarness:
             TypeError,
             ValueError,
         ) as error:
-            connection.server.events.put_nowait(error)
+            stream.initial_error = error
         return stream
 
     async def steer_turn(
@@ -566,7 +788,6 @@ class CodexHarness:
         *,
         timeout: float,
     ) -> ProviderCallResult[HarnessSessionReconciliation]:
-        timeout = min(timeout, self.input.startup_timeout)
         if session.provider_thread_id is None:
             return ProviderCallResult(
                 status=ProviderCallStatus.FAILED,
@@ -588,140 +809,147 @@ class CodexHarness:
                 )
             connection = Connection(self, request)
             connection.session = session
-        try:
-            async with timer_timeout(self.timer, ceil(timeout * 1000)):
-                for attempt in range(2):
-                    try:
-                        if (
-                            not hasattr(connection, "server")
-                            or connection.server.closed
-                            or connection.server.process.returncode is not None
-                            or connection.server.reader.done()
-                        ):
-                            if hasattr(connection, "server"):
-                                self.close(connection)
-                            await connection.open(timeout=timeout)
-                        result = await connection.server.request(
-                            "thread/read",
+        for attempt in range(2):
+            if (
+                not hasattr(connection, "server")
+                or connection.server.closed
+                or connection.server.process.returncode is not None
+                or connection.server.reader.done()
+            ):
+                if hasattr(connection, "server"):
+                    self.close(connection, timeout=timeout)
+                try:
+                    await connection.open(timeout=timeout)
+                except (
+                    AppServerError,
+                    OSError,
+                    TimeoutError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    return ProviderCallResult(
+                        status=ProviderCallStatus.FAILED,
+                        failure=failure(
+                            error,
+                            needs_reconciliation=isinstance(
+                                error, (AppServerUnavailable, TimeoutError)
+                            ),
+                        ),
+                    )
+            try:
+                async with timer_timeout(self.timer, ceil(timeout * 1000)):
+                    result = await connection.server.request(
+                        "thread/read",
+                        {
+                            "threadId": session.provider_thread_id,
+                            "includeTurns": True,
+                        },
+                    )
+                thread = result["thread"]
+                if thread["id"] != session.provider_thread_id:
+                    raise AppServerError(
+                        "Codex returned a different provider thread",
+                        reason=HarnessFailureReason.STATE_MISMATCH,
+                    )
+                previous = connection.stream
+                status = thread["status"]["type"]
+                stream = None
+                if status == "active":
+                    turns = [
+                        item
+                        for item in thread["turns"]
+                        if item["status"] == "inProgress"
+                    ]
+                    if (
+                        turn is None
+                        or approval_handler is None
+                        or len(turns) != 1
+                        or self.turns.get(session.id) != (turn.id, turns[0]["id"])
+                    ):
+                        raise AppServerError(
+                            "The active Codex turn cannot be reconciled",
+                            reason=HarnessFailureReason.STATE_MISMATCH,
+                        )
+                    if previous is not None:
+                        previous.finished = True
+                    stream = TurnStream(connection, turn, approval_handler, timeout)
+                    stream.provider_turn_id = turns[0]["id"]
+                    connection.stream = stream
+                    connection.source.turn_id = turn.id
+                    connection.source.turns[turns[0]["id"]] = turn.id
+                elif status in {"idle", "notLoaded"}:
+                    async with timer_timeout(self.timer, ceil(timeout * 1000)):
+                        response = await connection.server.request(
+                            "thread/resume",
                             {
                                 "threadId": session.provider_thread_id,
-                                "includeTurns": True,
+                                "cwd": str(connection.request.workspace),
+                                "model": self.model,
+                                "developerInstructions": "\n\n".join(
+                                    connection.request.instructions
+                                ),
+                                "approvalPolicy": "on-request",
+                                "sandbox": SANDBOX_POLICIES[
+                                    connection.request.sandbox_policy
+                                ],
                             },
                         )
-                        thread = result["thread"]
-                        if thread["id"] != session.provider_thread_id:
-                            raise AppServerError(
-                                "Codex returned a different provider thread",
-                                reason=HarnessFailureReason.STATE_MISMATCH,
-                            )
-                        previous = connection.stream
-                        status = thread["status"]["type"]
-                        stream = None
-                        if status == "active":
-                            turns = [
-                                item
-                                for item in thread["turns"]
-                                if item["status"] == "inProgress"
-                            ]
-                            if (
-                                turn is None
-                                or approval_handler is None
-                                or len(turns) != 1
-                                or self.turns.get(session.id)
-                                != (turn.id, turns[0]["id"])
-                            ):
-                                raise AppServerError(
-                                    "The active Codex turn cannot be reconciled",
-                                    reason=HarnessFailureReason.STATE_MISMATCH,
-                                )
-                            if previous is not None:
-                                previous.finished = True
-                            stream = TurnStream(
-                                connection, turn, approval_handler, timeout
-                            )
-                            stream.provider_turn_id = turns[0]["id"]
-                            connection.stream = stream
-                        elif status in {"idle", "notLoaded"}:
-                            response = await connection.server.request(
-                                "thread/resume",
-                                {
-                                    "threadId": session.provider_thread_id,
-                                    "cwd": str(connection.request.workspace),
-                                    "model": self.model,
-                                    "developerInstructions": "\n\n".join(
-                                        connection.request.instructions
-                                    ),
-                                    "approvalPolicy": "on-request",
-                                    "sandbox": SANDBOX_POLICIES[
-                                        connection.request.sandbox_policy
-                                    ],
-                                },
-                            )
-                            if response["thread"]["id"] != session.provider_thread_id:
-                                raise AppServerError(
-                                    "Codex resumed a different provider thread",
-                                    reason=HarnessFailureReason.STATE_MISMATCH,
-                                )
-                            if previous is not None:
-                                previous.finished = True
-                            connection.stream = None
-                        else:
-                            raise AppServerError(
-                                f"Unsupported Codex thread status: {status}",
-                                reason=HarnessFailureReason.PROTOCOL,
-                            )
-                        self.connections[session.id] = connection
-                        return ProviderCallResult(
-                            status=ProviderCallStatus.CONFIRMED,
-                            value=HarnessSessionReconciliation(
-                                connection.session, stream
-                            ),
+                    if response["thread"]["id"] != session.provider_thread_id:
+                        raise AppServerError(
+                            "Codex resumed a different provider thread",
+                            reason=HarnessFailureReason.STATE_MISMATCH,
                         )
-                    except asyncio.CancelledError:
-                        if hasattr(connection, "server"):
-                            self.close(connection)
-                        raise
-                    except AppServerUnavailable as error:
-                        logger.warning(
-                            "Codex recovery attempt %s failed for session %s: %s",
-                            attempt + 1,
-                            session.id,
-                            error,
-                        )
-                        if hasattr(connection, "server"):
-                            self.close(connection)
-                        if attempt == 0:
-                            continue
-                        return ProviderCallResult(
-                            status=ProviderCallStatus.FAILED,
-                            failure=failure(error, needs_reconciliation=True),
-                        )
-                    except (
-                        AppServerError,
-                        OSError,
-                        KeyError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
-                        if hasattr(connection, "server"):
-                            self.close(connection)
-                        if isinstance(error, (KeyError, TypeError, ValueError)):
-                            error = AppServerError(
-                                str(error), reason=HarnessFailureReason.PROTOCOL
-                            )
-                        return ProviderCallResult(
-                            status=ProviderCallStatus.FAILED,
-                            failure=failure(error, needs_reconciliation=False),
-                        )
-                raise AssertionError("Codex reconciliation did not return")
-
-        except TimeoutError as error:
-            if hasattr(connection, "server"):
-                self.close(connection)
-            return ProviderCallResult(
-                status=ProviderCallStatus.FAILED,
-                failure=failure(error, needs_reconciliation=True),
-            )
+                    if previous is not None:
+                        previous.finished = True
+                    connection.stream = None
+                else:
+                    raise AppServerError(
+                        f"Unsupported Codex thread status: {status}",
+                        reason=HarnessFailureReason.PROTOCOL,
+                    )
+                self.connections[session.id] = connection
+                return ProviderCallResult(
+                    status=ProviderCallStatus.CONFIRMED,
+                    value=HarnessSessionReconciliation(connection.session, stream),
+                )
+            except asyncio.CancelledError:
+                if hasattr(connection, "server"):
+                    self.close(connection, timeout=timeout)
+                raise
+            except (AppServerUnavailable, TimeoutError) as error:
+                logger.warning(
+                    "Codex recovery attempt %s failed for session %s: %s",
+                    attempt + 1,
+                    session.id,
+                    error,
+                )
+                if hasattr(connection, "server"):
+                    self.close(connection, timeout=timeout)
+                if attempt == 0:
+                    continue
+                return ProviderCallResult(
+                    status=ProviderCallStatus.FAILED,
+                    failure=failure(error, needs_reconciliation=True),
+                )
+            except (
+                AppServerError,
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as error:
+                if hasattr(connection, "server"):
+                    self.close(connection, timeout=timeout)
+                if isinstance(error, (KeyError, TypeError, ValueError)):
+                    error = AppServerError(
+                        str(error), reason=HarnessFailureReason.PROTOCOL
+                    )
+                return ProviderCallResult(
+                    status=ProviderCallStatus.FAILED,
+                    failure=failure(error, needs_reconciliation=False),
+                )
+        raise AssertionError("Codex reconciliation did not return")
 
     async def has_background_job(
         self, session: HarnessSession, *, timeout: float
@@ -739,7 +967,21 @@ class CodexHarness:
                 )
         except AppServerError, OSError, TimeoutError:
             # An unavailable status cannot establish that the session is idle.
+            logger.warning(
+                "Could not query Codex background terminals for session %s",
+                session.id,
+                exc_info=True,
+            )
             return True
+        try:
+            BackgroundTerminalsResponse.model_validate(result)
+        except ValidationError:
+            logger.warning(
+                "Invalid Codex background-terminal response for session %s; "
+                "retaining the current handling",
+                session.id,
+                exc_info=True,
+            )
         return bool(result["data"])
 
     async def stop_session(
@@ -752,26 +994,40 @@ class CodexHarness:
         self.turns.pop(session.id, None)
         connection = self.connections.pop(session.id, None)
         if connection is not None:
-            task = self.close(connection)
+            task = self.close(connection, timeout=timeout)
             try:
-                async with timer_timeout(
-                    self.timer, ceil(min(timeout, self.input.shutdown_timeout) * 1000)
-                ):
+                async with timer_timeout(self.timer, ceil(timeout * 1000)):
                     await asyncio.shield(task)
-            except TimeoutError as error:
-                return ProviderCallResult(
-                    status=ProviderCallStatus.FAILED,
-                    failure=failure(error, needs_reconciliation=False),
+            except AppServerError, OSError, TimeoutError:
+                logger.warning(
+                    "Codex session %s cleanup continues in the background",
+                    session.id,
+                    exc_info=True,
                 )
         return ProviderCallResult(status=ProviderCallStatus.CONFIRMED, value=session)
 
     async def aclose(self):
         for connection in tuple(self.connections.values()):
-            self.close(connection)
+            self.close(connection, timeout=self.input.shutdown_timeout)
         self.connections.clear()
         self.sessions.clear()
         self.turns.clear()
         if self.closing:
+            try:
+                async with timer_timeout(
+                    self.timer, ceil(self.input.shutdown_timeout * 1000)
+                ):
+                    await asyncio.gather(
+                        *(asyncio.shield(task) for task in tuple(self.closing)),
+                        return_exceptions=True,
+                    )
+            except TimeoutError:
+                logger.warning("Forcing Codex cleanup at the node shutdown deadline")
+            finally:
+                # A cleanup begun with a longer ordinary-call budget must not
+                # outlive node shutdown. Cancellation enters its force/reap path.
+                for task in tuple(self.closing):
+                    task.cancel()
             await asyncio.gather(
                 *(asyncio.shield(task) for task in tuple(self.closing)),
                 return_exceptions=True,

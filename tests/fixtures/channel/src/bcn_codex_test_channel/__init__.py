@@ -10,12 +10,12 @@ import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing, asynccontextmanager
 from functools import partial
-from math import ceil
 from pathlib import Path
 from time import time_ns
 from typing import Any, ClassVar, Literal, cast
 from uuid import NAMESPACE_URL, uuid5, uuid7
 
+import aiofiles
 from bazaar_contrib_audit import AUDIT_EVENT, AuditEvent
 from bazaar_contrib_channel import (
     CHANNEL,
@@ -44,7 +44,7 @@ from bazaar_contrib_channel import (
 from bazaar_contrib_harness import ApprovalResult, HarnessOutput, harness_builder_key
 from bazaar_contrib_timer import TIMER, Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from bazaar_core import Context, Contrib
+from bazaar_core import Context, Contrib, ServiceKey
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
@@ -53,6 +53,23 @@ class ChannelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     endpoint_file: str = "channel.json"
     inspection_file: Path
+
+
+class AuditJournal:
+    def __init__(self):
+        self.paths: dict[str, Path] = {}
+        self.lock = asyncio.Lock()
+
+
+JOURNAL = ServiceKey[AuditJournal]("codex-test.audit-journal")
+
+
+async def persist(ctx: Context, event: AuditEvent):
+    journal = ctx.accept(JOURNAL)
+    path = journal.paths.get(event.context.agent_id)
+    if path is not None:
+        async with journal.lock, aiofiles.open(path, "a") as stream:
+            await stream.write(event.model_dump_json() + "\n")
 
 
 class Attachment(BaseModel):
@@ -131,10 +148,15 @@ class TestChannel:
     def get_identity(self) -> ChannelIdentity:
         return ChannelIdentity(id=self.input.agent_id, name=self.input.agent_name)
 
+    def backfill_provider_thread_id(
+        self, provider_thread_id: str, *, channel: str, channel_identity: str
+    ) -> str:
+        return provider_thread_id
+
     def dm_address(self, request: DmRequest) -> DmAddress | None:
         if request.sender_id is None:
             return None
-        identity = f"{self.kind}:{self.input.agent_id}:dm:{request.sender_id}"
+        identity = f"{self.kind}:dm:{request.sender_id}"
         return DmAddress(
             channel_session_id=str(uuid5(NAMESPACE_URL, identity + ":channel")),
             thread_id=str(uuid5(NAMESPACE_URL, identity + ":thread")),
@@ -155,7 +177,9 @@ class TestChannel:
                 packet = json.loads(data)
                 if "inbound" in packet:
                     message = ChannelMessage.model_validate(packet["inbound"])
-                    identity = f"{self.kind}:{self.input.agent_id}:{message.target.kind}:{message.target.thread_id}"
+                    identity = (
+                        f"{self.kind}:{message.target.kind}:{message.target.thread_id}"
+                    )
                     await self.inbound.put(
                         InboundMessage(
                             **message.model_dump(exclude={"id", "attachments"}),
@@ -311,8 +335,7 @@ class TestChannel:
         self.pending[id] = asyncio.get_running_loop().create_future()
         await self.outbound.put({"id": id, "approval": request.model_dump(mode="json")})
         try:
-            async with timer_timeout(self.timer, ceil(timeout * 1000)):
-                packet = await self.pending[id]
+            packet = await self.pending[id]
             return ApprovalResult.model_validate(packet["decision"])
         finally:
             self.pending.pop(id, None)
@@ -327,6 +350,9 @@ def record(ctx: Context, event: AuditEvent):
 @asynccontextmanager
 async def channel_lifespan(ctx: Context, config: ChannelConfig):
     input = ctx.accept(CHANNEL_INPUT)
+    ctx.accept(JOURNAL).paths[input.agent_id] = config.inspection_file.with_name(
+        "audit.jsonl"
+    )
     async with timer_timeout(ctx.accept(TIMER), 30_000):
         inspection = await ctx.accept(harness_builder_key("codex")).inspect(
             input.workspace, timeout=30
@@ -369,7 +395,7 @@ async def channel_lifespan(ctx: Context, config: ChannelConfig):
 
 channel = Contrib(
     config=ChannelConfig,
-    accepts=[CHANNEL_INPUT, TIMER, harness_builder_key("codex")],
+    accepts=[CHANNEL_INPUT, TIMER, harness_builder_key("codex"), JOURNAL],
     offers=[CHANNEL],
     lifespan=channel_lifespan,
     listen={AUDIT_EVENT: record},
@@ -384,6 +410,7 @@ class ChannelBuilderParameters(ChannelBuilderConfig):
 
 @asynccontextmanager
 async def channel_builder_lifespan(ctx: Context, config: ChannelBuilderParameters):
+    ctx.offer(JOURNAL, AuditJournal())
     with ctx.accept(CHANNEL_BUILDERS).register(config.builder()) as builder:
         ctx.offer(channel_builder_key(builder.kind), builder)
         yield
@@ -392,6 +419,7 @@ async def channel_builder_lifespan(ctx: Context, config: ChannelBuilderParameter
 channel_builder = Contrib(
     config=ChannelBuilderParameters,
     accepts=[CHANNEL_BUILDERS],
-    offers=[channel_builder_key("test-channel")],
+    offers=[channel_builder_key("test-channel"), JOURNAL],
     lifespan=channel_builder_lifespan,
+    listen={AUDIT_EVENT: persist},
 )

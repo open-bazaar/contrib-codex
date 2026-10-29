@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, ClassVar
 
+from bazaar_contrib_audit import AUDIT
 from bazaar_contrib_harness import (
     HARNESS,
     HARNESS_BUILDERS,
@@ -33,6 +34,7 @@ async def lifespan(ctx: Context, config: Config):
     instance = CodexHarness(
         ctx.accept(HARNESS_INPUT),
         ctx.accept(TIMER),
+        ctx.accept(AUDIT),
         config.model,
         config.effort,
     )
@@ -44,7 +46,10 @@ async def lifespan(ctx: Context, config: Config):
 
 
 harness = Contrib(
-    config=Config, accepts=[HARNESS_INPUT, TIMER], offers=[HARNESS], lifespan=lifespan
+    config=Config,
+    accepts=[HARNESS_INPUT, TIMER, AUDIT],
+    offers=[HARNESS],
+    lifespan=lifespan,
 )
 
 

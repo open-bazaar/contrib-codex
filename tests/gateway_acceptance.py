@@ -19,6 +19,9 @@ def main() -> int:
         raise RuntimeError("Gateway acceptance requires the Linux Docker runner")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--cache-dir", type=Path, default=Path(".artifacts/prefix-cache")
+    )
     parser.add_argument("--upstream", default="http://model:8080")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
@@ -29,6 +32,8 @@ def main() -> int:
         parser.error("Supply the original acceptance command after --")
     output = arguments.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    cache = arguments.cache_dir.resolve()
+    cache.mkdir(parents=True, exist_ok=True)
     identifiers = discover()
     model = next(
         inspect(identifier)
@@ -42,17 +47,20 @@ def main() -> int:
         "compose",
         "--project-name",
         project,
-        "--file",
-        labels["com.docker.compose.project.config_files"],
     ]
+    for configuration in labels["com.docker.compose.project.config_files"].split(","):
+        compose.extend(["--file", configuration])
     name = project + "-preheat-" + uuid4().hex[:8]
     state: dict = {"project": project, "container_name": name, "model_id": model["id"]}
     routed = False
     process = None
     returncode = 1
 
+    gateway = next(Path(os.environ["RUNNER_TEMP"]).glob("ai-gateway-*/state.json"))
+    environment = os.environ | json.loads(gateway.read_text())["environment"]
+
     def run(*items: str):
-        subprocess.run(items, check=True)
+        subprocess.run(items, check=True, env=environment)
 
     def provider(url: str):
         # Keep the action's existing local/local-model entry throughout the suite.
@@ -71,6 +79,51 @@ def main() -> int:
         )
 
     try:
+        configuration = json.loads(
+            docker("inspect", "--format", "{{json .Config}}", model["id"])
+        )
+        metadata = next(Path(os.environ["RUNNER_TEMP"]).glob("ai-gateway-*/model.json"))
+        (output / "cache-identity.json").write_text(
+            json.dumps(
+                {
+                    "model_sha256": json.loads(metadata.read_text())["sha256"],
+                    "image": configuration["Image"],
+                    "command": configuration["Cmd"],
+                }
+            )
+        )
+        directory = output / "cache-model"
+        directory.mkdir(exist_ok=True)
+        configuration = directory / "compose.yml"
+        configuration.write_text(
+            json.dumps(
+                {
+                    "services": {
+                        "model": {
+                            "environment": {"LLAMA_ARG_SLOT_SAVE_PATH": "/cache"},
+                            "volumes": [f"{cache}:/cache"],
+                        }
+                    }
+                }
+            )
+        )
+        compose.extend(["--file", str(configuration)])
+        run(
+            *compose,
+            "up",
+            "--detach",
+            "--force-recreate",
+            "--no-deps",
+            "--wait",
+            "model",
+        )
+        state["model_id"] = subprocess.run(
+            (*compose, "ps", "--quiet", "model"),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=environment,
+        ).stdout.strip()
         run(
             "docker",
             "run",
@@ -95,6 +148,8 @@ def main() -> int:
             + ",dst=/preheat.mjs,readonly",
             "--mount",
             f"type=bind,src={output},dst=/evidence",
+            "--mount",
+            f"type=bind,src={cache},dst=/cache",
             "node:24.18.0-bookworm-slim",
             "node",
             "/preheat.mjs",

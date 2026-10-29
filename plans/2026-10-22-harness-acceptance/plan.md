@@ -2,6 +2,102 @@
 
 ## Task 2：0.2 行为对齐与已合并宿主契约（2026-10-25）
 
+### 原生收发的完整审计（2026-10-27）
+
+开发线程 369c50e8-8906-5e1f-b242-790fd5c670d5 要求全部发布、由订阅方筛选；
+e5ac83b9-bc91-539f-b094-b9470766ad92 指出仅审计已映射 HarnessOutput 不足以覆盖所有源事件。
+运行 provider 明确接受 AUDIT，在原生 JSONL 读写边界发布完整数据、连接来源、源序号及墙钟／单调时间，
+随后才进行关闭筛选、去重、请求分发和中立投影；进程结束后发布最终序号及退出结果。
+请求／响应与原生及宿主会话／turn 关联随源记录保留，中立业务输出及 Agent 自身执行审计继续独立发布。
+TestChannel 测试的根插件订阅 Audit 到独立 JSONL，生命周期覆盖所属 provider 的退出；不加入生产测试注入。
+
+- [x] 对照原生读写、映射、取消及关闭调用链，补齐源审计发布与公共 HarnessSourceEvent。
+- [x] 用真实 TestChannel 验证双向源顺序、关闭序号、输出对应和资源释放，记录实际覆盖限制。
+
+两仓联合源码及 Codex 0.164.0／Qwen3.5-4B 128K／4 CPU 的八场业务驱动全部通过（2580.475 秒）。
+独立订阅有 3227 条 AuditEvent、1806 条原生消息，12 个来源均从 1 连续记录至关闭所声明的最终序号；
+1211 条中立输出各自匹配唯一审计，原生投影在源记录中可找到。10 个隔离节点退出 0，自有进程、容器、
+网络、卷及端口清空，资源采样没有 OOM 或采样错误。双方 Ruff／format 与最终源码 LSP 通过。
+该轮运行中仅按插件状态讨论移除四个文件的未用 health getter／聚合，精确差异已独立核对；
+不宣称所有源码前后完全一致。临时外层脚本误要求命中旧缓存，实际新身份 13972 token 正常预热后
+在这条断言返回 1；原始错误保留，八场业务／审计驱动及独立清理核验通过的结论分别记录。
+本轮未触发的 payload 分支不宣称动态覆盖；主仓对应 PR125，provider 本地修改继续保留未提交供 review。
+
+### 公共前缀的磁盘缓存（2026-10-27）
+
+开发线程 02fa49ff-d4c3-5aec-8d14-02c31ebe3bf2 要求实际验证持久化 KV，
+33e3aa71-0ff1-5aff-9450-5e028eeb65a6 确定首次正常预热保存、下次命中使用；
+1d8f023c-2f8e-58cc-8939-227cc752e01e 明确本地直接读写磁盘，Actions 只取存缓存目录。
+
+固定 llama.cpp b11749／1d88cb05 与 Qwen3.5-4B、128K、4 CPU 的本地真实 TestChannel 对照通过：
+13981 token 冷预热 358.535 秒；磁盘保存 616595848 字节、294.591ms；完整重建模型容器后恢复
+13981 token 用 139.851ms，再请求相同前缀时 cache_n=13977、prompt_n=4、prompt_ms=565.003。
+包括进程调用开销，恢复及前缀验证合计 0.840 秒。后续真实 MCP 检查通过，76 条中立输出均一一对应
+独立 Audit；自有节点、容器、网络和卷清空。此次针对缓存的单场对照不替代前述八场迁移验收。
+
+测试入口使用稳定的 --cache-dir（默认 .artifacts/prefix-cache），给自有模型与预热代理挂载同一目录；
+通过自有临时 Compose 配置设置原生 LLAMA_ARG_SLOT_SAVE_PATH=/cache，并在业务执行前重建模型。
+公共前缀继续来自真实请求的模型模板与分词结果；缓存身份绑定 GGUF SHA、推理镜像、启动参数及实际
+前缀 token SHA。目录保存一份 prefix.bin 和对应 entry.json；身份命中时调用原生 slot restore，
+首次或身份改变时执行既有真实预热，然后 slot save 并更新身份。真实请求与 SSE 字节继续原样转发。
+
+CI 在测试前 actions/cache/restore 取回同一目录，测试后只在本次生成快照时 actions/cache/save 保存，
+缓存 key 使用依赖锁与运行中确认的完整缓存身份。缓存事件写入原预热证据，记录命中来源和原生时序。
+
+- [x] 在全新模型容器验证磁盘快照恢复、实际前缀复用与真实 MCP 业务。
+- [x] 接入现有预热入口和 Actions 目录取存，完成静态与真实恢复验证后交付 review。
+
+实际修改后的测试入口已完成冷／热两轮本地源码验收：首次预热 347.635 秒，保存 13981 token、
+616595848 字节；下一轮完整重建模型容器后命中相同身份，读盘恢复 0.150 秒，未再次预热。
+恢复后的首个真实业务请求报告 cached_tokens=13981。两轮 MCP-once 均通过，业务驱动耗时分别为
+421.361 秒与 73.917 秒；151 条中立输出与 175 条独立 Audit 中的对应记录逐一匹配，缺口为零，
+包括四条关闭输出。两个节点、代理、模型容器、网络、卷及网关端口均已清理，两个 MCP 检查点均无反馈重试。
+记录的两仓源码 hash 在运行前后保持一致。Ruff／format、联合源码 LSP、Node 语法、工作流 YAML
+与内嵌 Python 检查均通过；Actions 远端上传／下载尚未实际运行，工作流和测试修订保留本地供 review。
+
+### 全面对照后的行为修订（2026-10-27）
+
+以 v0.2.3 的最终结果为对照，开发线程 `6fb9035e-d64e-5956-b8cd-3be946e82fde`
+逐项决定修订；`2dba2a27-8f32-5fa0-94bb-858b969945b2` 澄清仅 inspect 这类整次查询
+在调用入口控制总超时。会话初始化、文件监听与恢复恢复各自的预算和重试，
+本节替代下文将所有调用一概改为入口总预算的范围表述。
+
+- 人工审批等待不设超时，原生响应写入保留有界等待；TestChannel 同步移除决定等待期限。
+- 初始化与文件监听超时后换进程再尝试一次；初始化、每次监听使用启动预算，
+  thread/start 使用完整调用方预算。恢复的 thread/read、thread/resume 各使用调用方预算，
+  请求超时及连接退出后重连重试；管道写入 OSError 转为可恢复的连接退出。
+- 取消 turn/start 时结束并解除本地 stream、回收可能已经接受请求的原生连接，
+  保留逻辑会话及 thread 供恢复；请求失败在首次 stream 消费时交付，优先于缓存通知。
+- `45d490d2-ca0c-5cd1-b4af-6e5c80f51d71` 确认关闭预算区分：普通回收用调用方预算，
+  恢复清理用恢复预算，lifespan 用节点关闭预算；保留后台清理和关闭确认语义。
+  节点退出到期时强制完成先前使用长预算的清理。正常关闭分阶段只向 app-server 主进程发信号，
+  退出后的自有进程组／后代回收保留；意外退出按原生 wait／管道 EOF 时机处理。
+- 审批 created_at_ms 保留原生 startedAtMs；退出错误带最后一行 stderr，保留 64 行尾部。
+- JSONL 接受 EOF 前的完整 JSON，空行仍报告协议错误；id 使用严格整数／字符串，
+  result 的对象校验放在对应 RPC 的响应边界，避免单次响应错误终止整个 reader。
+- 原生服务端请求按回合与 request id 去重，处理中的重复 id 也不另起任务；
+  不支持的交互和处理异常记录日志并拒绝，未知方法使用 JSON-RPC 错误拒绝，保持连接。
+- 异常后台状态增加诊断日志，保持当前忙闲判定；元数据查询保留已取得的部分模型。
+- `9f2dc87e-9afc-5086-854f-4a52cc286fb9` 要求事件保持 provider 中立以适用于 Claude Code。
+  后续 `bee7b7cd-7b92-54bc-b2e2-2c10b6d11d2e`、`585ab635-f200-51b4-8c7c-caae4c2a163b`
+  和 `43895714-0bda-5b1e-aa50-1de5c328ae93` 明确中立语义必须投影，raw 不能代替。
+  第 16 项将 0.2 共用的 ContentDelta、ToolCall、ToolCallTextDelta、FileChangeEntry、
+  TokenUsage／UsageUpdated 与 compaction 载荷恢复到公共 Harness。Codex 在原生边界构造对应类型，
+  分别保留 reasoning summaryIndex／contentIndex，工具以 call_id 关联名称及输入／输出，
+  patchUpdated 转为 FileChangeEntry，outputDelta／progress 转为 ToolCallTextDelta，
+  terminalInteraction 转为 ToolCallInteraction；保留结构化失败、来源关联与审计诊断原文。
+  TestChannel 验收消费中立工具载荷，开始输入与结束结果通过 call_id 关联；测试观测继续由自制插件订阅 Audit。
+  主仓与 provider 联合源码 LSP、Ruff 及 provider wheel／sdist 构建已通过。
+  用户 86d0299b-c9ea-59ed-8bc7-ecd7cd6a4147 要求本地 workspace 验证；使用两仓当前源码、Codex 0.164.0、
+  本地 Qwen3.5-4B 128K／4 CPU 的八个真实 TestChannel 场景全部通过（2731.636 秒）。
+  1411 条 AuditEvent、1210 条中立输出均通过公共模型校验；全部输出与独立审计一一对应，
+  包括退出阶段的 7 条取消与 5 条用量。10 个隔离节点正常退出，所属进程、容器、网络、卷及端口清空。
+  MCP 六个业务检查点全部成功，无反馈重试；BCC、full-access、恢复、刷新和后台任务均达到业务检查点。
+  两仓执行源码在验证前后保持一致；未触发的事件分支不据此宣称动态覆盖。
+
+- [x] 完成上述 provider 与审批控制面的修订并核对逐项差异。
+- [x] 完成静态、类型、构建及真实 TestChannel 业务验证，记录实际覆盖和限制。
+
 ### 关闭审计完整性修复（2026-10-27）
 
 关闭时 core 将全部实例标记为 Stopping，但事件分发仅接收 Running 的订阅者，
@@ -301,8 +397,8 @@ TestChannel 沿原有入站契约将测试会话标记为已审核，再观察�
 这些观察均由已有 TestChannel 审计订阅完成。
 
 TCP 收信持续异步运行，在执行、判定目标达成和应用关闭期间原样保存全部 AuditEvent 与
-HarnessOutput。MCP 目标以原生 `tool.completed`／`tool.failed` 为观测边界，核对服务、工具、
-参数、真实 MCP 服务调用日志／结构化结果与审批；不把工具完成写成自然回合完成。只有正常结束但
+HarnessOutput。MCP 目标以中立 ToolCallCompleted／ToolCallFailed 为观测边界，按 call_id 关联
+起始 input 与最终 output，核对 call.name、真实 MCP 服务调用日志／结构化结果与审批；不把工具完成写成自然回合完成。只有正常结束但
 没有目标调用或 MCP 审批的尝试才接受最多八次实际入站反馈，反馈保持原 session／thread。
 
 需要连续上下文的审批、恢复、steering 与刷新步骤仍在各自用例内部执行。

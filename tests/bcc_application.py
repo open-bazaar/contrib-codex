@@ -11,15 +11,23 @@ import socket
 import sys
 import tomllib
 from http.client import HTTPConnection
+from itertools import pairwise
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid7
 
 import psutil
 import tomli_w
 from bazaar_contrib_audit import AuditEvent
 from bazaar_contrib_channel import ChannelApprovalRequest, ChannelTarget, SenderIdentity
-from bazaar_contrib_harness import ApprovalResult, ApprovalScope, HarnessOutput
+from bazaar_contrib_harness import (
+    ApprovalResult,
+    ApprovalScope,
+    HarnessOutput,
+    HarnessSourceEvent,
+)
 from bcn_codex_test_channel import ChannelMessage
+from pydantic import TypeAdapter
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("root", type=Path)
@@ -42,6 +50,7 @@ root = arguments.root.resolve()
 scenario = arguments.scenario
 command = Path(__file__).with_name("run_application.py")
 MCP_FEEDBACK_LIMIT = 8
+AUDIT_EVENT = TypeAdapter[AuditEvent](AuditEvent)
 
 
 async def exercise():
@@ -184,14 +193,25 @@ async def exercise():
         assert process.returncode == 0, record
         assert not alive, record
         audits: dict[str, list[AuditEvent]] = {}
+        sources: dict[str, list[HarnessSourceEvent]] = {}
+        closed: dict[str, dict[str, Any]] = {}
+        for line in (root / "audit.jsonl").read_text().splitlines():
+            audit = AUDIT_EVENT.validate_json(line)
+            audits.setdefault(json.dumps(audit.payload, sort_keys=True), []).append(
+                audit
+            )
+            if audit.event_name in {"harness.source.sent", "harness.source.received"}:
+                source = HarnessSourceEvent.model_validate(audit.payload)
+                sources.setdefault(source.source_id, []).append(source)
+                assert audit.event_name == f"harness.source.{source.direction}"
+                assert audit.context.session_id
+                assert audit.observed_at_ms >= source.occurred_at_ms
+            elif audit.event_name == "harness.source.closed":
+                payload = cast(dict[str, Any], audit.payload)
+                closed[payload["source_id"]] = payload
         outputs = []
         for line in (root / "events.jsonl").read_text().splitlines():
             packet = json.loads(line)
-            if "audit" in packet:
-                audit = AuditEvent.model_validate(packet["audit"])
-                audits.setdefault(json.dumps(audit.payload, sort_keys=True), []).append(
-                    audit
-                )
             if "event" in packet:
                 outputs.append(
                     (packet["phase"], HarnessOutput.model_validate(packet["event"]))
@@ -202,7 +222,7 @@ async def exercise():
                 json.dumps(output.model_dump(mode="json"), sort_keys=True), []
             )
             if not any(
-                audit.event_name == f"harness.{output.kind}"
+                audit.event_name == f"harness.{output.payload.type}"
                 and all(
                     getattr(audit.context, field) == getattr(output, field)
                     for field in (
@@ -222,6 +242,37 @@ async def exercise():
         (root / "audit-coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
         print(json.dumps({"audit_coverage": coverage}), flush=True)
         assert outputs and not unmatched, coverage
+        assert sources and set(sources) == set(closed)
+        source_coverage = {}
+        for source_id, messages in sources.items():
+            messages.sort(key=lambda event: event.sequence)
+            assert [event.sequence for event in messages] == list(
+                range(1, closed[source_id]["sequence"] + 1)
+            )
+            directions = {event.direction for event in messages}
+            assert directions == {"sent", "received"}
+            assert all(
+                previous.monotonic_ns <= current.monotonic_ns
+                for previous, current in pairwise(messages)
+            )
+            source_coverage[source_id] = {
+                "messages": len(messages),
+                "sent": sum(event.direction == "sent" for event in messages),
+                "received": sum(event.direction == "received" for event in messages),
+                "closed": closed[source_id],
+                "methods": sorted(
+                    {
+                        packet["method"]
+                        for event in messages
+                        for packet in (json.loads(event.data),)
+                        if packet.get("method")
+                    }
+                ),
+            }
+        (root / "source-audit-coverage.json").write_text(
+            json.dumps(source_coverage, indent=2) + "\n"
+        )
+        print(json.dumps({"source_audit_coverage": source_coverage}), flush=True)
 
     async def restart(number):
         nonlocal process, writer, collector
@@ -288,6 +339,7 @@ async def exercise():
             requested_turn_id = None
             entered = input_message_id is None
             previous_items = set()
+            commands = {}
             while (packet := await queue.get()) is not None:
                 audit = packet.get("audit", {})
                 if (
@@ -296,7 +348,8 @@ async def exercise():
                 ):
                     canonical_message_id = audit["payload"]["id"]
                 event = packet.get("event", {})
-                item = event.get("metadata", {}).get("item", {})
+                payload = event.get("payload", {})
+                call = payload.get("call", {})
                 if (
                     audit.get("event_name") == "harness.turn.requested"
                     and canonical_message_id
@@ -318,13 +371,13 @@ async def exercise():
                     approval_requests.append(audit["payload"])
                 elif audit.get("event_name") == "approval.decided":
                     approval_decisions.append(audit["payload"])
-                assert event.get("kind") != "compaction.started", (
+                assert payload.get("type") != "compaction.started", (
                     f"Context compaction entered during {label}; inspect events.jsonl"
                 )
                 if (
                     steer
                     and not steered
-                    and event.get("kind") in {"text", "tool.started"}
+                    and payload.get("type") in {"content_delta", "tool.started"}
                 ):
                     await inbound("Please keep your reply brief.")
                     steered = True
@@ -359,41 +412,40 @@ async def exercise():
                             "decision": decision.model_dump(mode="json"),
                         }
                     )
-                if event.get("kind") == "tool.started":
+                if payload.get("type") == "tool.started":
                     if entered:
-                        started_tools.append({"kind": event["kind"], "item": item})
+                        started_tools.append({"kind": payload["type"], "call": call})
                     else:
-                        previous_items.add(item["id"])
+                        previous_items.add(call["call_id"])
+                    if isinstance(call["input"], str) and re.search(
+                        r"\bbcc(?:\.cmd)?(?=[\s\"']|$)", call["input"]
+                    ):
+                        commands[call["call_id"]] = call["input"]
                 if (
                     entered
-                    and item.get("id") not in previous_items
-                    and event.get("kind") in {"tool.completed", "tool.failed"}
+                    and call.get("call_id") not in previous_items
+                    and payload.get("type") in {"tool.completed", "tool.failed"}
                 ):
-                    tools.append({"kind": event["kind"], "item": item})
+                    tools.append({"kind": payload["type"], "call": call})
                 if (
-                    event.get("kind") == "tool.completed"
-                    and item.get("type") == "commandExecution"
-                    and item.get("exitCode") == 0
-                    and re.search(
-                        r"\bbcc(?:\.cmd)?(?=[\s\"']|$)", item.get("command", "")
-                    )
+                    payload.get("type") == "tool.completed"
+                    and call.get("call_id") in commands
                 ):
-                    calls.append(item["command"])
+                    calls.append(commands[call["call_id"]])
                 if (
                     entered
                     and mcp
-                    and item.get("id") not in previous_items
-                    and event.get("kind") in {"tool.completed", "tool.failed"}
-                    and item.get("type") == "mcpToolCall"
-                    and item.get("server") == "test"
-                    and item.get("tool") == "get_value"
+                    and call.get("call_id") not in previous_items
+                    and payload.get("type") in {"tool.completed", "tool.failed"}
+                    and call.get("name") == "test/get_value"
                 ):
                     terminal = event
                     completion = "mcp_result"
                     break
                 if entered and (
-                    event.get("kind") in {"completed", "cancelled", "failed", "unknown"}
-                    or (stop_at_started and event.get("kind") == "started")
+                    payload.get("type")
+                    in {"completed", "cancelled", "failed", "unknown"}
+                    or (stop_at_started and payload.get("type") == "started")
                 ):
                     terminal = event
                     completion = "turn_event"
@@ -402,7 +454,7 @@ async def exercise():
                 "The channel closed before the requested state was observed"
             )
             if completion != "mcp_result":
-                assert terminal["kind"] == (
+                assert terminal["payload"]["type"] == (
                     "started" if stop_at_started else "completed"
                 ), terminal
             mcp_log = root / "mcp-requests.jsonl"
@@ -421,7 +473,7 @@ async def exercise():
                 "session": terminal["session_id"],
                 "provider_thread": terminal["provider_session_id"],
                 "provider_turn": terminal["provider_turn_id"],
-                "state": terminal["kind"],
+                "state": terminal["payload"]["type"],
                 "completion": completion,
                 "input_message_id": input_message_id,
                 "canonical_message_id": canonical_message_id,
@@ -443,14 +495,17 @@ async def exercise():
             calls = [
                 tool
                 for tool in record["tools"]
-                if tool["item"].get("type") == "mcpToolCall"
-                and tool["item"].get("server") == "test"
-                and tool["item"].get("tool") == "get_value"
+                if tool["call"].get("name") == "test/get_value"
             ]
             assert calls and all(tool["kind"] == "tool.completed" for tool in calls), (
                 record
             )
-            assert any(tool["item"]["arguments"] == arguments for tool in calls)
+            assert any(
+                started["call"]["input"] == arguments
+                and started["call"]["call_id"] == tool["call"]["call_id"]
+                for started in record["started_tools"]
+                for tool in calls
+            )
             queries = [
                 query
                 for query in record["mcp_queries"]
@@ -461,7 +516,7 @@ async def exercise():
                 for query in queries
             ), record
             assert any(
-                tool["item"]["result"]["structuredContent"] == query["result"]
+                tool["call"]["output"]["structuredContent"] == query["result"]
                 for tool in calls
                 for query in queries
             )
@@ -522,9 +577,7 @@ async def exercise():
                     context = actual_context
                 assert actual_context == context, record
                 called = any(
-                    tool["item"].get("type") == "mcpToolCall"
-                    and tool["item"].get("server") == "test"
-                    and tool["item"].get("tool") == "get_value"
+                    tool["call"].get("name") == "test/get_value"
                     for tool in record["started_tools"] + record["tools"]
                 )
                 approval_requested = any(
@@ -580,7 +633,7 @@ async def exercise():
                 if interaction["decision"]["decision"] == "rejected"
             }
             assert rejected and any(
-                tool["kind"] == "tool.failed" and tool["item"]["id"] in rejected
+                tool["kind"] == "tool.failed" and tool["call"]["call_id"] in rejected
                 for tool in continued["tools"]
             ), continued
 

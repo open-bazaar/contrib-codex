@@ -7,7 +7,7 @@ from typing import Any
 
 from bazaar_contrib_harness import ApprovalHandler, ApprovalRequest, ApprovalScope
 
-from .transport import Packet
+from .transport import AppServerError, Packet
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,9 @@ def decline(packet: Packet) -> dict[str, Any]:
         case _ if packet.method == ELICITATION:
             return {"action": "decline", "content": None}
         case _:
-            return {}
+            raise AppServerError(
+                f"Unsupported Codex server request: {packet.method}", code=-32601
+            )
 
 
 async def interact(
@@ -113,6 +115,7 @@ async def interact(
         action=action,
         details=params,
         allowed_scopes=tuple(scopes),
+        **({"created_at_ms": params["startedAtMs"]} if "startedAtMs" in params else {}),
     )
     result = await handler.request_approval(request, timeout=timeout)
     if result.decision != "approved":

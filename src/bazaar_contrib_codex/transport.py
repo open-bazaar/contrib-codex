@@ -11,6 +11,7 @@ import logging
 import os
 import signal
 import subprocess
+from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine
 from importlib.metadata import version
 from math import ceil
@@ -21,10 +22,21 @@ import psutil
 from bazaar_contrib_harness import HarnessFailure, HarnessFailureReason
 from bazaar_contrib_timer import Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    TypeAdapter,
+    ValidationError,
+)
+
+from .source import SourceAudit
 
 logger = logging.getLogger(__name__)
 cleanup: set[asyncio.Task[Any]] = set()
+RESULT = TypeAdapter(dict[str, Any])
 
 
 def background[T](work: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
@@ -43,11 +55,11 @@ def background[T](work: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
 
 class Packet(BaseModel):
     model_config = ConfigDict(extra="allow")
-    id: int | str | None = None
+    id: StrictInt | StrictStr | None = None
     method: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
-    result: dict[str, Any] = Field(default_factory=dict)
-    error: dict[str, Any] | None = None
+    result: Any = None
+    error: Any = None
 
 
 class AppServerError(RuntimeError):
@@ -88,8 +100,7 @@ def failure(error: BaseException, *, needs_reconciliation: bool) -> HarnessFailu
         reason,
         str(error) or type(error).__name__,
         needs_reconciliation=needs_reconciliation
-        and reason
-        not in {HarnessFailureReason.EXECUTION, HarnessFailureReason.INTERRUPTED},
+        and reason is not HarnessFailureReason.EXECUTION,
         code=error.code
         if isinstance(error, AppServerError)
         else error.errno
@@ -107,14 +118,18 @@ class AppServer:
         timeout: float,
         *,
         timer: Timer | None = None,
+        source: SourceAudit | None = None,
     ):
         self.process = process
         self.handler = handler
         self.notify = notify
         self.timeout = timeout
         self.timer = timer
-        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.source = source
+        self.pending: dict[int, asyncio.Future[Any]] = {}
         self.requests: dict[int | str, asyncio.Task[None]] = {}
+        self.handled: set[tuple[str | None, int | str]] = set()
+        self.stderr_tail: deque[str] = deque(maxlen=64)
         self.events: asyncio.Queue[Packet | Exception] = asyncio.Queue()
         self.sequence = 0
         self.writing = asyncio.Lock()
@@ -135,6 +150,7 @@ class AppServer:
         *,
         timeout: float,
         timer: Timer | None = None,
+        source: SourceAudit | None = None,
     ) -> AppServer:
         process = await asyncio.create_subprocess_exec(
             "codex",
@@ -149,7 +165,7 @@ class AppServer:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             start_new_session=os.name != "nt",
         )
-        return cls(process, handler, notify, timeout, timer=timer)
+        return cls(process, handler, notify, timeout, timer=timer, source=source)
 
     async def initialize(self) -> dict[str, Any]:
         result = await self.request(
@@ -177,8 +193,21 @@ class AppServer:
         ):
             raise AppServerUnavailable("Codex app-server is no longer running")
         async with self.writing:
-            stdin.write(json.dumps(packet).encode() + b"\n")
-            await stdin.drain()
+            try:
+                data = json.dumps(packet)
+                stdin.write(data.encode() + b"\n")
+                if self.source is not None:
+                    await self.source.publish(
+                        data, "sent", Packet.model_validate(packet)
+                    )
+                await stdin.drain()
+            except OSError as error:
+                message = f"Codex app-server exited ({self.process.returncode})"
+                if self.stderr_tail:
+                    message += f": {self.stderr_tail[-1]}"
+                raise AppServerUnavailable(
+                    message, code=self.process.returncode
+                ) from error
 
     async def request(
         self,
@@ -191,7 +220,7 @@ class AppServer:
         self.pending[id] = future
         try:
             await self.write({"id": id, "method": method, "params": params})
-            return await future
+            return RESULT.validate_python(await future)
         finally:
             self.pending.pop(id, None)
             if not future.done():
@@ -201,13 +230,25 @@ class AppServer:
 
     async def answer(self, packet: Packet):
         try:
+            try:
+                response = {"id": packet.id, "result": await self.handler(packet)}
+            except Exception as error:
+                logger.exception("Rejecting Codex request %s", packet.id)
+                response = {
+                    "id": packet.id,
+                    "error": {
+                        "code": error.code
+                        if isinstance(error, AppServerError) and error.code is not None
+                        else -32603,
+                        "message": str(error) or type(error).__name__,
+                    },
+                }
             async with (
                 timer_timeout(self.timer, ceil(self.timeout * 1000))
                 if self.timer is not None
                 else asyncio.timeout(self.timeout)
             ):
-                result = await self.handler(packet)
-                await self.write({"id": packet.id, "result": result})
+                await self.write(response)
         except Exception:
             logger.exception(
                 "Could not send the response to Codex request %s", packet.id
@@ -221,17 +262,34 @@ class AppServer:
         assert stdout is not None
         buffer = bytearray()
         try:
-            while chunk := await stdout.read(64 * 1024):
+            while True:
+                chunk = await stdout.read(64 * 1024)
                 buffer.extend(chunk)
-                while (index := buffer.find(b"\n")) >= 0:
+                while (index := buffer.find(b"\n")) >= 0 or (not chunk and buffer):
+                    if index < 0:
+                        index = len(buffer)
                     line = bytes(buffer[:index])
                     del buffer[: index + 1]
-                    if not line.strip():
-                        continue
-                    packet = Packet.model_validate_json(line)
+                    data = line.decode()
+                    try:
+                        packet = Packet.model_validate_json(data)
+                    except ValidationError:
+                        if self.source is not None:
+                            await self.source.publish(data, "received")
+                        raise
+                    if self.source is not None:
+                        await self.source.publish(data, "received", packet)
                     if packet.method is not None:
                         if self.closed:
                             continue
+                        if packet.id is not None:
+                            key = (packet.params.get("turnId"), packet.id)
+                            if key in self.handled or packet.id in self.requests:
+                                logger.warning(
+                                    "Ignoring duplicate Codex request %s", packet.id
+                                )
+                                continue
+                            self.handled.add(key)
                         self.notify(packet)
                         self.events.put_nowait(packet)
                         if packet.id is not None and not self.closed:
@@ -248,24 +306,24 @@ class AppServer:
                     elif isinstance(packet.id, int):
                         future = self.pending.get(packet.id)
                         if future is not None and not future.done():
-                            if packet.error is not None:
+                            if "error" in packet.model_fields_set:
+                                error = (
+                                    packet.error
+                                    if isinstance(packet.error, dict)
+                                    else {}
+                                )
                                 future.set_exception(
                                     AppServerError(
                                         str(
-                                            packet.error.get(
-                                                "message", "Codex request failed"
-                                            )
+                                            error.get("message", "Codex request failed")
                                         ),
-                                        code=packet.error.get("code"),
+                                        code=error.get("code"),
                                     )
                                 )
                             else:
                                 future.set_result(packet.result)
-            if buffer.strip():
-                raise AppServerError(
-                    "Codex app-server ended with incomplete JSONL",
-                    reason=HarnessFailureReason.PROTOCOL,
-                )
+                if not chunk:
+                    break
         except Exception as error:  # noqa: BLE001 -- Isolate provider protocol failures.
             if isinstance(error, (ValidationError, KeyError, TypeError, ValueError)):
                 error = AppServerError(str(error), reason=HarnessFailureReason.PROTOCOL)
@@ -286,23 +344,19 @@ class AppServer:
         self.events.put_nowait(error)
 
     async def watch(self):
-        # Process.wait can await pipe EOF after the child exits. A background
-        # command retaining stdout must not delay cleanup of its process group.
-        if self.timer is None:
-            # Standalone metadata inspection has no session or background tools.
-            await self.process.wait()
-        else:
-            while self.process.returncode is None:
-                await self.timer.create(50).wait()
+        await self.process.wait()
         if os.name != "nt":
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         await asyncio.gather(self.reader, self.errors, return_exceptions=True)
+        message = f"Codex app-server exited ({self.process.returncode})"
+        if self.stderr_tail:
+            message += f": {self.stderr_tail[-1]}"
         self.fail(
             AppServerUnavailable(
-                f"Codex app-server exited ({self.process.returncode})",
+                message,
                 code=self.process.returncode,
             )
         )
@@ -310,9 +364,18 @@ class AppServer:
     async def read_errors(self):
         stderr = self.process.stderr
         assert stderr is not None
+        buffer = bytearray()
         while chunk := await stderr.read(64 * 1024):
-            for line in chunk.decode(errors="replace").splitlines():
+            buffer.extend(chunk)
+            while (index := buffer.find(b"\n")) >= 0:
+                line = bytes(buffer[:index]).decode(errors="replace").rstrip("\r")
+                del buffer[: index + 1]
+                self.stderr_tail.append(line)
                 logger.debug("Codex app-server stderr: %s", line)
+        if buffer:
+            line = buffer.decode(errors="replace").rstrip("\r")
+            self.stderr_tail.append(line)
+            logger.debug("Codex app-server stderr: %s", line)
 
     def close(self, *, timeout: float) -> asyncio.Task[None]:
         if self.closing is None:
@@ -351,27 +414,11 @@ class AppServer:
                     (0.8, "terminate"),
                     (0.9, "kill"),
                 ):
-                    if self.process.returncode is not None:
-                        break
-                    if operation is not None:
-                        if os.name != "nt":
-                            try:
-                                os.killpg(
-                                    self.process.pid,
-                                    signal.SIGTERM
-                                    if operation == "terminate"
-                                    else signal.SIGKILL,
-                                )
-                            except ProcessLookupError:
-                                pass
-                        else:
-                            for child in reversed(children):
-                                try:
-                                    getattr(child, operation)()
-                                except psutil.NoSuchProcess:
-                                    pass
-                            if self.process.returncode is None:
-                                getattr(self.process, operation)()
+                    if operation is not None and self.process.returncode is None:
+                        try:
+                            getattr(self.process, operation)()
+                        except ProcessLookupError:
+                            pass
                     try:
                         async with (
                             timer_timeout(
@@ -449,3 +496,13 @@ class AppServer:
                             pipe.close()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await self.process.wait()
+            if self.source is not None:
+                await self.source.audit.publish(
+                    "harness.source.closed",
+                    context=self.source.context,
+                    payload={
+                        "source_id": self.source.id,
+                        "sequence": self.source.sequence,
+                        "returncode": self.process.returncode,
+                    },
+                )
