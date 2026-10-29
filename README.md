@@ -24,3 +24,14 @@ Optional fields in the agent's `codex` Harness configuration:
 
 - `model`: Codex model; defaults to the Codex configuration.
 - `effort`: Reasoning effort; defaults to the Codex configuration.
+
+## Release
+
+Run the **Release** GitHub Actions workflow with a version such as `0.3.0rc1`.
+Stable releases run from `main`. The workflow checks the fixed release commit,
+builds a wheel and sdist, verifies their installation on Linux, macOS and Windows,
+publishes the same files to PyPI, and verifies a clean PyPI installation before
+pushing the annotated `vVERSION` tag.
+
+PyPI Trusted Publishing uses repository `open-bazaar/contrib-codex`, workflow
+`release.yml`, and GitHub environment `pypi` for project `bazaar-contrib-codex`.
