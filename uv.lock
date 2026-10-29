@@ -1,6 +1,9 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.15"
+
+[options]
+prerelease-mode = "allow"
 
 [[package]]
 name = "aiofiles"
