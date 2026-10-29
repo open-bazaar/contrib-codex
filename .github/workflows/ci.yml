@@ -35,6 +35,19 @@ jobs:
         run: uv build --no-sources
 
   e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - mcp-once
+          - mcp-session
+          - mcp-always
+          - bcc
+          - full-access
+          - recovery
+          - refresh
+          - background
+    name: e2e (${{ matrix.scenario }})
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -79,7 +92,7 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: |
           mkdir -p .artifacts
-          uv run --no-sync python -u tests/gateway_acceptance.py --output .artifacts/preheat --cache-dir .artifacts/prefix-cache -- python -u tests/gateway_resources.py .artifacts/gateway-resources.jsonl python -u -m pytest -vv -s --durations=10 -m e2e --model '${{ steps.gateway.outputs.model }}' --basetemp .artifacts/e2e
+          uv run --no-sync python -u tests/gateway_acceptance.py --output .artifacts/preheat --cache-dir .artifacts/prefix-cache -- python -u tests/gateway_resources.py .artifacts/gateway-resources.jsonl python -u -m pytest -vv -s -m e2e 'tests/test_application.py::test_installed_application[${{ matrix.scenario }}]' --model '${{ steps.gateway.outputs.model }}' --basetemp .artifacts/e2e
       - name: Prefix cache identity
         if: always()
         id: prefix
@@ -106,7 +119,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
-          name: bcc-acceptance
+          name: bcc-acceptance-${{ matrix.scenario }}
           path: |
             .artifacts/gateway-resources.jsonl
             .artifacts/preheat/
