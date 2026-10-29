@@ -38,6 +38,7 @@ jobs:
       - name: Checkout selected source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           ref: ${{ github.sha }}
       - name: Setup uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -57,6 +58,23 @@ jobs:
           result-encoding: string
           script: |
             const fs = require('fs');
+            if (!process.env.RELEASE_VERSION.includes('rc')) {
+              const changelog = fs.existsSync('CHANGELOG.md') ? fs.readFileSync('CHANGELOG.md', 'utf8') : '# Changelog\n\n';
+              if (!changelog.includes('## ' + process.env.RELEASE_VERSION + ' - ')) {
+                const previous = await exec.getExecOutput('git', ['describe', '--tags', '--abbrev=0', '--match', 'v*', '--exclude', '*rc*', context.sha], {silent: true, ignoreReturnCode: true});
+                const generated = await github.rest.repos.generateReleaseNotes({
+                  ...context.repo,
+                  tag_name: 'v' + process.env.RELEASE_VERSION,
+                  target_commitish: context.sha,
+                  ...(previous.exitCode === 0 ? {previous_tag_name: previous.stdout.trim()} : {}),
+                });
+                const index = changelog.indexOf('\n## ');
+                const offset = index < 0 ? changelog.length : index + 1;
+                const section = '## ' + process.env.RELEASE_VERSION + ' - ' + new Date().toISOString().slice(0, 10);
+                fs.writeFileSync('CHANGELOG.md', changelog.slice(0, offset) + section + '\n\n' + generated.data.body.trim() + '\n\n' + changelog.slice(offset));
+                await exec.exec('git', ['add', '--intent-to-add', 'CHANGELOG.md']);
+              }
+            }
             const changed = (await exec.getExecOutput('git', ['diff', '--name-only', '-z'], {silent: true})).stdout.split('\0').filter(Boolean);
             if (changed.length === 0) return context.sha;
             const message = 'Release v' + process.env.RELEASE_VERSION;
