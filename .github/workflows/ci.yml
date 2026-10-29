@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: '0.13.0'
+      - name: Install
+        run: uv sync --python 3.15 --prerelease allow
+      - name: Lint
+        run: uv run --no-sync ruff check .
+      - name: Format
+        run: uv run --no-sync ruff format --check .
+      - name: Types
+        run: uv run --no-sync pyright
+      - name: Build
+        run: uv build --no-sources
+
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - mcp-once
+          - mcp-session
+          - mcp-always
+          - bcc
+          - full-access
+          - recovery
+          - refresh
+          - background
+    name: e2e (${{ matrix.scenario }})
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: '0.13.0'
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Install Codex
+        run: npm install --global @openai/codex@0.164.0
+      - name: Version
+        run: codex --version
+      - name: Sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install
+        run: uv sync --python 3.15 --prerelease allow
+      - name: Preheat image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull node:24.18.0-bookworm-slim; then
+              exit 0
+            fi
+          done
+          exit 1
+      - name: Restore prefix cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .artifacts/prefix-cache
+          key: llama-prefix-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
+          restore-keys: llama-prefix-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
+      - name: Gateway
+        uses: yuchanns/setup-ai-gateway@564af746413273335294b725ff195acde1501f3d
+        id: gateway
+        with:
+          context-size: '131072'
+      - name: Test
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          mkdir -p .artifacts
+          uv run --no-sync python -u tests/gateway_acceptance.py --output .artifacts/preheat --cache-dir .artifacts/prefix-cache -- python -u tests/gateway_resources.py .artifacts/gateway-resources.jsonl python -u -m pytest -vv -s -m e2e 'tests/test_application.py::test_installed_application[${{ matrix.scenario }}]' --model '${{ steps.gateway.outputs.model }}' --basetemp .artifacts/e2e
+      - name: Prefix cache identity
+        if: always()
+        id: prefix
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          cache = Path('.artifacts/preheat/cache.json')
+          if cache.is_file():
+              cache = json.loads(cache.read_text())
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write(f"key={cache['key']}\n")
+                  output.write(f"created={str(cache['created']).lower()}\n")
+          PY
+      - name: Save prefix cache
+        if: always() && steps.prefix.outputs.created == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .artifacts/prefix-cache
+          key: llama-prefix-${{ runner.os }}-${{ hashFiles('uv.lock') }}-${{ steps.prefix.outputs.key }}
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: bcc-acceptance-${{ matrix.scenario }}
+          path: |
+            .artifacts/gateway-resources.jsonl
+            .artifacts/preheat/
+            .artifacts/e2e/**/build-*.log
+            .artifacts/e2e/**/install.log
+            .artifacts/e2e/**/python.log
+            .artifacts/e2e/**/bcc.log
+            .artifacts/e2e/**/*-prepare.log
+            .artifacts/e2e/**/bootstrap.log
+            .artifacts/e2e/**/activation.log
+            .artifacts/e2e/**/node.log
+            .artifacts/e2e/**/audit.jsonl
+            .artifacts/e2e/**/full-access-note.txt
+          include-hidden-files: true
+          if-no-files-found: warn
