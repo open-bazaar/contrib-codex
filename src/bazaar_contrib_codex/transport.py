@@ -139,6 +139,8 @@ class AppServer:
         self.writing = asyncio.Lock()
         if sys.platform == "win32":
             self._job: WindowsJob | None = None
+        else:
+            self._group: int | None = process.pid
         self.reader = asyncio.create_task(self.read())
         self.errors = asyncio.create_task(self.read_errors())
         self.watcher = asyncio.create_task(self.watch())
@@ -379,11 +381,13 @@ class AppServer:
             if self._job is not None:
                 self._job.close()
                 self._job = None
-        else:
+        elif self._group is not None:
             try:
-                os.killpg(self.process.pid, signal.SIGKILL)
+                os.killpg(self._group, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            # The watcher and close share one owned group; terminate it once.
+            self._group = None
 
     async def read_errors(self):
         stderr = self.process.stderr

@@ -19,10 +19,9 @@ from bazaar_contrib_codex.source import SourceAudit
 from bazaar_contrib_codex.transport import AppServer, AppServerUnavailable, Packet
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job ownership")
 @pytest.mark.parametrize("orphaned", [False, True], ids=["child", "grandchild"])
 @pytest.mark.parametrize("ending", ["exit", "close", "zero", "cancel"])
-async def test_windows_job_cleans_descendants_with_inherited_pipes(
+async def test_close_cleans_descendants_with_inherited_pipes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, orphaned: bool, ending: str
 ):
     ready = asyncio.Event()
