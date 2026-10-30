@@ -11,6 +11,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine
 from importlib.metadata import version
@@ -33,6 +34,9 @@ from pydantic import (
 )
 
 from .source import SourceAudit
+
+if sys.platform == "win32":
+    from .windows_job import CREATE_SUSPENDED, WindowsJob
 
 logger = logging.getLogger(__name__)
 cleanup: set[asyncio.Task[Any]] = set()
@@ -133,6 +137,8 @@ class AppServer:
         self.events: asyncio.Queue[Packet | Exception] = asyncio.Queue()
         self.sequence = 0
         self.writing = asyncio.Lock()
+        if sys.platform == "win32":
+            self._job: WindowsJob | None = None
         self.reader = asyncio.create_task(self.read())
         self.errors = asyncio.create_task(self.read_errors())
         self.watcher = asyncio.create_task(self.watch())
@@ -162,10 +168,21 @@ class AppServer:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED)
+            if sys.platform == "win32"
+            else 0,
             start_new_session=os.name != "nt",
         )
-        return cls(process, handler, notify, timeout, timer=timer, source=source)
+        server = cls(process, handler, notify, timeout, timer=timer, source=source)
+        if sys.platform == "win32":
+            try:
+                server._job = WindowsJob()
+                server._job.assign(process.pid)
+                psutil.Process(process.pid).resume()
+            except Exception:
+                await server.aclose(timeout=0)
+                raise
+        return server
 
     async def initialize(self) -> dict[str, Any]:
         result = await self.request(
@@ -345,11 +362,7 @@ class AppServer:
 
     async def watch(self):
         await self.process.wait()
-        if os.name != "nt":
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        self._end_group()
         await asyncio.gather(self.reader, self.errors, return_exceptions=True)
         message = f"Codex app-server exited ({self.process.returncode})"
         if self.stderr_tail:
@@ -360,6 +373,17 @@ class AppServer:
                 code=self.process.returncode,
             )
         )
+
+    def _end_group(self):
+        if sys.platform == "win32":
+            if self._job is not None:
+                self._job.close()
+                self._job = None
+        else:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     async def read_errors(self):
         stderr = self.process.stderr
@@ -438,11 +462,7 @@ class AppServer:
                         break
                     except TimeoutError:
                         continue
-                if os.name != "nt":
-                    try:
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                self._end_group()
                 for child in reversed(children):
                     try:
                         child.kill()
@@ -469,12 +489,8 @@ class AppServer:
         finally:
             if self.process.stdin is not None:
                 self.process.stdin.close()
-            if os.name != "nt":
-                try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            elif self.process.returncode is None:
+            self._end_group()
+            if sys.platform == "win32" and self.process.returncode is None:
                 self.process.kill()
             for child in reversed(children):
                 try:
