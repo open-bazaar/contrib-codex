@@ -24,3 +24,5 @@ Optional fields in the agent's `codex` Harness configuration:
 
 - `model`: Codex model; defaults to the Codex configuration.
 - `effort`: Reasoning effort; defaults to the Codex configuration.
+- `api_key`: API key injected as `OPENAI_API_KEY`, overriding the inherited value.
+  A custom Codex provider must use `env_key = "OPENAI_API_KEY"`.

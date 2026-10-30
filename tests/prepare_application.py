@@ -36,6 +36,8 @@ environment.update(
     CODEX_HOME=str(agent_root / "codex-home"),
     PATH=str(python.parent) + os.pathsep + os.environ["PATH"],
 )
+if scenario == "mcp-once":
+    environment["OPENAI_API_KEY"] = "inherited-key-overridden-by-config"
 (root / "environment.private.json").write_text(
     json.dumps(
         {
@@ -44,7 +46,9 @@ environment.update(
                 "BCN_HOME",
                 "CODEX_HOME",
                 "PATH",
+                "OPENAI_API_KEY",
             )
+            if name in environment
         }
     )
 )
@@ -87,6 +91,9 @@ codex = {
         }
     },
 }
+if scenario == "mcp-once":
+    agents[0]["harness"][0]["api_key"] = environment["AI_API_KEY"]
+    codex["model_providers"]["gateway"]["env_key"] = "OPENAI_API_KEY"
 (home / "config.toml").write_text(tomli_w.dumps(codex))
 rules = home / "rules"
 rules.mkdir(exist_ok=True)
