@@ -29,6 +29,7 @@ async def test_close_cleans_descendants_with_inherited_pipes(
     events: list[AuditEvent] = []
     descendants: list[psutil.Process] = []
     root_ready = False
+    exercised = False
 
     async def record(ctx: Context, event: AuditEvent):
         nonlocal root_ready
@@ -39,7 +40,9 @@ async def test_close_cleans_descendants_with_inherited_pipes(
             payload = cast(dict[str, Any], event.payload)
             packet = Packet.model_validate_json(payload["data"])
             if packet.method == "test/leaf":
-                descendants.append(psutil.Process(packet.params["pid"]))
+                descendants.append(
+                    await asyncio.to_thread(psutil.Process, packet.params["pid"])
+                )
             elif packet.method == "test/root-ready":
                 root_ready = True
             if descendants and root_ready:
@@ -83,6 +86,7 @@ async def test_close_cleans_descendants_with_inherited_pipes(
 
     @asynccontextmanager
     async def exercise(ctx: Context):
+        nonlocal exercised
         server = await AppServer.start(
             tmp_path,
             {},
@@ -105,9 +109,9 @@ async def test_close_cleans_descendants_with_inherited_pipes(
                 await server.watcher
                 assert isinstance(server.error, AppServerUnavailable)
                 assert server.error.code == 7
-                assert not any(
-                    process.is_running() and process.status() != psutil.STATUS_ZOMBIE
-                    for process in descendants
+                await asyncio.to_thread(psutil.wait_procs, descendants)
+                assert not await asyncio.to_thread(
+                    lambda: any(process.is_running() for process in descendants)
                 )
                 await server.aclose(timeout=30)
             elif ending == "cancel":
@@ -119,17 +123,18 @@ async def test_close_cleans_descendants_with_inherited_pipes(
                 await server.aclose(timeout=0 if ending == "zero" else 30)
             await closed.wait()
             assert len(descendants) == 1
-            assert not any(
-                process.is_running() and process.status() != psutil.STATUS_ZOMBIE
-                for process in descendants
+            await asyncio.to_thread(psutil.wait_procs, descendants)
+            assert not await asyncio.to_thread(
+                lambda: any(process.is_running() for process in descendants)
             )
+            exercised = True
             yield
         finally:
             if server.closing is None:
                 await server.aclose(timeout=0)
             for process in descendants:
                 try:
-                    process.kill()
+                    await asyncio.to_thread(process.kill)
                 except psutil.NoSuchProcess:
                     pass
             await asyncio.to_thread(psutil.wait_procs, descendants)
@@ -159,6 +164,7 @@ async def test_close_cleans_descendants_with_inherited_pipes(
         ),
     ):
         pass
+    assert exercised
     closures = [
         event for event in events if event.event_name == "harness.source.closed"
     ]

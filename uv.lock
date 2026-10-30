@@ -269,6 +269,7 @@ dependencies = [
     { name = "bazaar-contrib-harness" },
     { name = "bazaar-contrib-timer" },
     { name = "bazaar-core" },
+    { name = "blockbuster" },
     { name = "mcp" },
     { name = "pydantic" },
 ]
@@ -281,6 +282,7 @@ requires-dist = [
     { name = "bazaar-contrib-harness", specifier = ">=0.3.0rc9,<0.4" },
     { name = "bazaar-contrib-timer", specifier = "~=0.3.0rc9" },
     { name = "bazaar-core", specifier = ">=0.3.0rc9,<0.4" },
+    { name = "blockbuster", specifier = ">=1.5.29,<1.6" },
     { name = "mcp", specifier = ">=2.3.0" },
     { name = "pydantic", specifier = ">=2.12.0" },
 ]

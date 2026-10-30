@@ -57,6 +57,14 @@ def background[T](work: Coroutine[Any, Any, T]) -> asyncio.Task[T]:
     return task
 
 
+def _kill_children(children: list[psutil.Process]) -> None:
+    for child in reversed(children):
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 class Packet(BaseModel):
     model_config = ConfigDict(extra="allow")
     id: StrictInt | StrictStr | None = None
@@ -192,7 +200,7 @@ class AppServer:
             {
                 "clientInfo": {
                     "name": "bazaar_contrib_codex",
-                    "version": version("bazaar-contrib-codex"),
+                    "version": await asyncio.to_thread(version, "bazaar-contrib-codex"),
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -431,7 +439,9 @@ class AppServer:
                 self.requests.clear()
                 try:
                     children = await asyncio.to_thread(
-                        psutil.Process(self.process.pid).children, recursive=True
+                        lambda: psutil.Process(self.process.pid).children(
+                            recursive=True
+                        )
                     )
                 except psutil.NoSuchProcess:
                     pass
@@ -467,11 +477,7 @@ class AppServer:
                     except TimeoutError:
                         continue
                 self._end_group()
-                for child in reversed(children):
-                    try:
-                        child.kill()
-                    except psutil.NoSuchProcess:
-                        pass
+                await asyncio.to_thread(_kill_children, children)
                 if self.timer is None:
                     await asyncio.to_thread(
                         psutil.wait_procs,
@@ -496,11 +502,7 @@ class AppServer:
             self._end_group()
             if sys.platform == "win32" and self.process.returncode is None:
                 self.process.kill()
-            for child in reversed(children):
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
+            await asyncio.to_thread(_kill_children, children)
             for task in tasks:
                 task.cancel()
             self.fail(AppServerUnavailable("Codex app-server was closed"))
