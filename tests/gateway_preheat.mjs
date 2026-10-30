@@ -1,6 +1,6 @@
 // Warm one real, model-visible prefix before forwarding the acceptance traffic.
 import http from 'node:http';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { Transform } from 'node:stream';
 
@@ -15,11 +15,11 @@ function record(value) {
 
 const sha256 = body => createHash('sha256').update(body).digest('hex');
 
-function post(path, body) {
+function post(path, body, connection = { hostname: upstream.hostname, port: upstream.port }) {
   const bytes = Buffer.from(JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const request = http.request({
-      hostname: upstream.hostname, port: upstream.port, path, method: 'POST', agent,
+      ...connection, path, method: 'POST', agent,
       headers: { 'content-type': 'application/json', 'content-length': bytes.length },
     }, response => {
       const chunks = [];
@@ -67,10 +67,9 @@ async function preheat(body, requestId) {
   const prefixHash = sha256(JSON.stringify(prefix));
   const identity = JSON.parse(readFileSync('/evidence/cache-identity.json', 'utf8'));
   const key = sha256(JSON.stringify({ identity, prefix_sha256: prefixHash }));
-  const entry = existsSync('/cache/entry.json')
-    ? JSON.parse(readFileSync('/cache/entry.json', 'utf8')) : undefined;
-  if (entry?.key === key) {
-    const started = performance.now();
+  const started = performance.now();
+  const found = await post('/restore', { key }, { socketPath: '/evidence/cache.sock' });
+  if (found.restored) {
     const restored = await post('/slots/0?action=restore', { filename: 'prefix.bin' });
     const cache = {
       key, created: false, prefix_tokens: length, prefix_sha256: prefixHash,
@@ -85,14 +84,14 @@ async function preheat(body, requestId) {
     first_request_tokens: actual.length, prefix_sha256: prefixHash,
     tool_count: body.tools?.length ?? 0, n_predict: 1,
   });
-  const started = performance.now();
+  const warming = performance.now();
   // This one generated token is discarded. It cannot invoke a native tool.
   const result = await post('/completion', {
     prompt: prefix, n_predict: 1, stream: false, cache_prompt: true,
   });
   record({
     kind: 'warmup.complete', request_id: requestId, prefix_tokens: length,
-    elapsed_seconds: (performance.now() - started) / 1000,
+    elapsed_seconds: (performance.now() - warming) / 1000,
     timings: result.timings, tokens_cached: result.tokens_cached,
     tokens_evaluated: result.tokens_evaluated, tokens_predicted: result.tokens_predicted,
     discarded_output_characters: result.content?.length ?? 0,
@@ -101,7 +100,7 @@ async function preheat(body, requestId) {
   const cache = {
     key, created: true, prefix_tokens: length, prefix_sha256: prefixHash, ...saved,
   };
-  writeFileSync('/cache/entry.json', JSON.stringify({ key }), { mode: 0o600 });
+  await post('/save', { key }, { socketPath: '/evidence/cache.sock' });
   writeFileSync('/evidence/cache.json', JSON.stringify(cache), { mode: 0o600 });
   record({ kind: 'cache.saved', ...cache });
 }

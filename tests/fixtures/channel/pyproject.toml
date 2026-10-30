@@ -9,6 +9,7 @@ dependencies = [
     "bazaar-contrib-channel>=0.3.0rc9,<0.4",
     "bazaar-contrib-harness>=0.3.0rc9,<0.4",
     "bazaar-contrib-timer~=0.3.0rc9",
+    "blockbuster>=1.5.29,<1.6",
     "mcp>=2.3.0",
     "pydantic>=2.12.0",
 ]

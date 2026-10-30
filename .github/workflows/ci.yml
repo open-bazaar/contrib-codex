@@ -38,6 +38,8 @@ jobs:
         run: uv run --no-sync ruff format --check .
       - name: Types
         run: uv run --no-sync pyright
+      - name: Process cleanup
+        run: uv run --no-sync pytest -q tests/test_process_cleanup.py
       - name: Build
         run: uv build --no-sources
 
@@ -85,45 +87,20 @@ jobs:
             fi
           done
           exit 1
-      - name: Restore prefix cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .artifacts/prefix-cache
-          key: llama-prefix-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
-          restore-keys: llama-prefix-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
+      - name: Install prefix cache client
+        run: npm ci --prefix .github/actions/prefix-cache
       - name: Gateway
         uses: yuchanns/setup-ai-gateway@564af746413273335294b725ff195acde1501f3d
         id: gateway
         with:
           context-size: '131072'
       - name: Test
+        uses: ./.github/actions/prefix-cache
         env:
           PYTHONUNBUFFERED: '1'
-        run: |
-          mkdir -p .artifacts
-          uv run --no-sync python -u tests/gateway_acceptance.py --output .artifacts/preheat --cache-dir .artifacts/prefix-cache -- python -u tests/gateway_resources.py .artifacts/gateway-resources.jsonl python -u -m pytest -vv -s -m e2e 'tests/test_application.py::test_installed_application[${{ matrix.scenario }}]' --model '${{ steps.gateway.outputs.model }}' --basetemp .artifacts/e2e
-      - name: Prefix cache identity
-        if: always()
-        id: prefix
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          cache = Path('.artifacts/preheat/cache.json')
-          if cache.is_file():
-              cache = json.loads(cache.read_text())
-              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-                  output.write(f"key={cache['key']}\n")
-                  output.write(f"created={str(cache['created']).lower()}\n")
-          PY
-      - name: Save prefix cache
-        if: always() && steps.prefix.outputs.created == 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .artifacts/prefix-cache
-          key: llama-prefix-${{ runner.os }}-${{ hashFiles('uv.lock') }}-${{ steps.prefix.outputs.key }}
+          scenario: ${{ matrix.scenario }}
+          model: ${{ steps.gateway.outputs.model }}
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
