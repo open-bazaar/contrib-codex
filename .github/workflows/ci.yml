@@ -70,7 +70,7 @@ jobs:
         with:
           node-version: '24'
       - name: Install Codex
-        run: npm install --global @openai/codex@0.164.0
+        run: npm install --global @openai/codex@latest
       - name: Version
         run: codex --version
       - name: Sandbox
