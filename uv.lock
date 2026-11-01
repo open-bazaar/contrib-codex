@@ -91,7 +91,7 @@ wheels = [
 
 [[package]]
 name = "bazaar-contrib-codex"
-version = "0.3.0rc2"
+version = "0.3.0rc3"
 source = { editable = "." }
 dependencies = [
     { name = "bazaar-contrib-audit" },
