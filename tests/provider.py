@@ -7,6 +7,9 @@ from typing import Any
 
 import psutil
 import tomli_w
+from bazaar_core import ContribEntry
+
+from bazaar_contrib_codex import harness
 
 KIND = "codex"
 PACKAGE = "bazaar-contrib-codex"
@@ -34,6 +37,9 @@ BACKGROUND = (
     "as the foreground command in a persistent tool terminal, without a trailing "
     "`&`. Keep that terminal running after this turn."
 )
+STEERING_INPUT = "Reply with one short sentence."
+HARNESS_ENTRY = ContribEntry(name="harness", definition=harness)
+EXIT_CLOSES_SOURCE = False
 
 
 def configure(
@@ -93,9 +99,33 @@ def approval_call_id(approval: dict[str, Any]) -> str:
 def session_processes(
     parent: psutil.Process, environment: dict[str, str]
 ) -> list[psutil.Process]:
-    return [
-        child
-        for child in parent.children()
-        if "app-server" in child.cmdline()
-        and child.environ().get(HOME) == environment[HOME]
-    ]
+    processes = []
+    for child in parent.children():
+        try:
+            if (
+                "app-server" in child.cmdline()
+                and child.environ().get(HOME) == environment[HOME]
+            ):
+                processes.append(child)
+        except psutil.NoSuchProcess:
+            continue
+    return processes
+
+
+def steering_input(direction: str, packet: dict[str, Any]) -> str | None:
+    if direction == "sent" and packet.get("method") in {"turn/start", "turn/steer"}:
+        return str(packet["id"])
+    return None
+
+
+def steering_settled(direction: str, packet: dict[str, Any]) -> str | None:
+    if direction == "received" and "method" not in packet and "result" in packet:
+        return str(packet["id"])
+    return None
+
+
+def steering_result(direction: str, packet: dict[str, Any]) -> dict[str, Any] | None:
+    if packet.get("method") != "turn/completed":
+        return None
+    turn = packet["params"]["turn"]
+    return {"turn": turn["id"], "status": turn["status"]}
