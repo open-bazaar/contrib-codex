@@ -495,6 +495,9 @@ class Connection:
         self.home: Path | None = None
 
     async def open(self, *, timeout: float):
+        environment = self.request.environment.copy()
+        if self.owner.api_key is not None:
+            environment["OPENAI_API_KEY"] = self.owner.api_key
         for attempt in range(2):
             self.source = SourceAudit(
                 self.owner.audit,
@@ -510,7 +513,7 @@ class Connection:
             ):
                 self.server = await AppServer.start(
                     self.request.workspace,
-                    self.request.environment,
+                    environment,
                     self.answer,
                     self.notify,
                     timer=self.owner.timer,
@@ -605,12 +608,14 @@ class CodexHarness:
         audit: Audit,
         model: str | None,
         effort: str | None,
+        api_key: str | None = None,
     ):
         self.input = input
         self.timer = timer
         self.audit = audit
         self.model = model
         self.effort = effort
+        self.api_key = api_key
         self.connections: dict[str, Connection] = {}
         self.sessions: dict[str, SessionInput] = {}
         self.turns: dict[str, tuple[str, str]] = {}

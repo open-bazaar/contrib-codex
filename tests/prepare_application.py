@@ -12,6 +12,7 @@ from importlib.metadata import version
 from pathlib import Path
 from uuid import uuid4
 
+import provider
 import tomli_w
 
 root = Path(sys.argv[1]).resolve()
@@ -24,73 +25,68 @@ scenario = sys.argv[5]
 environment = {
     name: value
     for name, value in os.environ.items()
-    if not name.startswith(("BCN_", "BCC_", "CODEX_", "OPENAI_", "MYSCRM_", "APOLLO_"))
+    if not name.startswith(
+        (
+            "BCN_",
+            "BCC_",
+            "CODEX_",
+            "CLAUDE_",
+            "ANTHROPIC_",
+            "OPENAI_",
+            "MYSCRM_",
+            "APOLLO_",
+        )
+    )
 }
 endpoint = (
     rf"\\.\pipe\bccj-{uuid4()}"
     if os.name == "nt"
     else "/tmp/bccj-" + str(uuid4()) + ".sock"
 )
-environment.update(
-    BCN_HOME=str(root / "home"),
-    CODEX_HOME=str(agent_root / "codex-home"),
-    PATH=str(python.parent) + os.pathsep + os.environ["PATH"],
-)
-(root / "environment.private.json").write_text(
-    json.dumps(
-        {
-            name: environment[name]
-            for name in (
-                "BCN_HOME",
-                "CODEX_HOME",
-                "PATH",
-            )
-        }
-    )
-)
-(root / "environment.private.json").chmod(0o600)
-home = Path(environment["CODEX_HOME"])
+home = agent_root / provider.HOME_DIRECTORY
 home.mkdir(parents=True, exist_ok=True)
 workspace = agent_root / "workspace"
 workspace.mkdir(parents=True, exist_ok=True)
+environment.update(
+    BCN_HOME=str(root / "home"),
+    PATH=str(python.parent) + os.pathsep + os.environ["PATH"],
+)
+environment[provider.HOME] = str(home)
+provider.configure(environment, home, workspace, python, model, scenario)
 agents = [
     {
         "id": "assistant",
         "name": "Assistant",
         "workspace": str(workspace),
         "mode": "session",
-        "channel": [{"kind": "test-channel", "audit_file": str(root / "audit.jsonl")}],
-        "harness": [{"kind": "codex", "model": model}],
+        "channel": [
+            {
+                "kind": "test-channel",
+                "audit_file": str(root / "audit.jsonl"),
+                "harness": provider.KIND,
+            }
+        ],
+        "harness": [{"kind": provider.KIND, "model": model}],
     }
 ]
-if scenario == "full-access":
+if scenario == "mcp-once":
+    environment[provider.API_KEY] = "inherited-key-overridden-by-config"
+    agents[0]["harness"][0]["api_key"] = environment["AI_API_KEY"]
+if scenario in provider.FULL_ACCESS:
     agents[0]["session"] = {"config": {"sandbox": {"policy": "danger-full-access"}}}
-codex = {
-    "model": model,
-    "model_context_window": 131072,
-    "model_auto_compact_token_limit": 98304,
-    "model_provider": "gateway",
-    "model_providers": {
-        "gateway": {
-            "name": "Local test gateway",
-            "base_url": environment["AI_GATEWAY_BASE_URL"].rstrip("/") + "/v1",
-            "env_key": "AI_API_KEY",
-            "wire_api": "responses",
+if scenario == "refresh":
+    for name in provider.INSTRUCTION_FILES:
+        (workspace / name).write_text("Keep replies clear.\n")
+(root / "environment.private.json").write_text(
+    json.dumps(
+        {
+            name: environment[name]
+            for name in ("BCN_HOME", provider.HOME, "PATH", *provider.PRIVATE)
+            if name in environment
         }
-    },
-    "mcp_servers": {
-        "test": {
-            "command": str(python),
-            "args": ["-m", "bcn_codex_test_channel.mcp"],
-            "default_tools_approval_mode": "auto",
-            "required": True,
-        }
-    },
-}
-(home / "config.toml").write_text(tomli_w.dumps(codex))
-rules = home / "rules"
-rules.mkdir(exist_ok=True)
-(rules / "bcc.rules").write_text('prefix_rule(pattern=["bcc"], decision="prompt")\n')
+    )
+)
+(root / "environment.private.json").chmod(0o600)
 config = root / "node.toml"
 command = [str(python), "-m", "bazaar_compute_node"]
 print("Bootstrap installed application", config, flush=True)
@@ -115,11 +111,11 @@ for package in document["contribs"]:
 document["contribs"] = [
     package
     for package in document["contribs"]
-    if package["package"] not in {"bcn-codex-test-channel", "bazaar-contrib-codex"}
+    if package["package"] not in {"bcn-test-channel", provider.PACKAGE}
 ]
 for package, entry in (
-    ("bcn-codex-test-channel", "test-channel-builder"),
-    ("bazaar-contrib-codex", "codex-builder"),
+    ("bcn-test-channel", "test-channel-builder"),
+    (provider.PACKAGE, provider.BUILDER),
 ):
     (wheel,) = distributions.glob(package.replace("-", "_") + "-*.whl")
     document["contribs"].append(
@@ -150,7 +146,7 @@ print(
             "bcn_version": version("bazaar-compute-node"),
             "agent_id": "assistant",
             "workspace": str(workspace),
-            "codex_home": str(home),
+            "config_dir": str(home),
             "bcn_packages": {
                 package.metadata["Name"]: package.version
                 for package in installed_distributions()

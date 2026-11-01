@@ -1,4 +1,4 @@
-"""Observe a real Codex turn using bcc in an isolated installed application."""
+"""Observe a real Harness turn using bcc in an isolated installed application."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid7
 
+import provider
 import psutil
 import tomli_w
 from bazaar_contrib_audit import AuditEvent
@@ -25,24 +26,12 @@ from bazaar_contrib_harness import (
     ApprovalScope,
     HarnessSourceEvent,
 )
-from bcn_codex_test_channel import ChannelMessage
+from bcn_test_channel import ChannelMessage
 from pydantic import TypeAdapter
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("root", type=Path)
-parser.add_argument(
-    "scenario",
-    choices=(
-        "mcp-once",
-        "mcp-session",
-        "mcp-always",
-        "bcc",
-        "full-access",
-        "recovery",
-        "refresh",
-        "background",
-    ),
-)
+parser.add_argument("scenario", choices=provider.SCENARIOS)
 parser.add_argument("workspace", type=Path)
 arguments = parser.parse_args()
 root = arguments.root.resolve()
@@ -57,7 +46,16 @@ async def exercise():
         key: value
         for key, value in os.environ.items()
         if not key.startswith(
-            ("BCN_", "BCC_", "CODEX_", "OPENAI_", "MYSCRM_", "APOLLO_")
+            (
+                "BCN_",
+                "BCC_",
+                "CODEX_",
+                "CLAUDE_",
+                "ANTHROPIC_",
+                "OPENAI_",
+                "MYSCRM_",
+                "APOLLO_",
+            )
         )
     } | json.loads((root / "environment.private.json").read_text())
     log = (root / "node.log").open("wb")
@@ -177,7 +175,7 @@ async def exercise():
                 pass
         record = {
             "node_pid": process.pid,
-            "codex_home": environment["CODEX_HOME"],
+            "config_dir": environment[provider.HOME],
             "node_returncode": process.returncode,
             "live_owned_children": alive,
             "live_owned_processes": details,
@@ -364,10 +362,11 @@ async def exercise():
                         started_tools.append({"kind": payload["type"], "call": call})
                     else:
                         previous_items.add(call["call_id"])
-                    if isinstance(call["input"], str) and re.search(
-                        r"\bbcc(?:\.cmd)?(?=[\s\"']|$)", call["input"]
+                    command = provider.bcc_command(call)
+                    if command is not None and re.search(
+                        r"\bbcc(?:\.cmd)?(?=[\s\"']|$)", command
                     ):
-                        commands[call["call_id"]] = call["input"]
+                        commands[call["call_id"]] = command
                 if (
                     entered
                     and call.get("call_id") not in previous_items
@@ -384,7 +383,7 @@ async def exercise():
                     and mcp
                     and call.get("call_id") not in previous_items
                     and payload.get("type") in {"tool.completed", "tool.failed"}
-                    and call.get("name") == "test/get_value"
+                    and call.get("name") == provider.MCP_TOOL
                 ):
                     terminal = event
                     completion = "mcp_result"
@@ -433,7 +432,7 @@ async def exercise():
             calls = [
                 tool
                 for tool in record["tools"]
-                if tool["call"].get("name") == "test/get_value"
+                if tool["call"].get("name") == provider.MCP_TOOL
             ]
             assert calls and all(tool["kind"] == "tool.completed" for tool in calls), (
                 record
@@ -445,14 +444,14 @@ async def exercise():
                 for tool in calls
             )
             assert any(
-                tool["call"]["output"]["structuredContent"]
+                provider.mcp_output(tool["call"])
                 == {"key": arguments["key"], "value": "MCP_OK"}
                 for tool in calls
             ), record
             interactions = [
                 interaction
                 for interaction in record["interactions"]
-                if interaction["request"]["approval"]["action"] == "mcp_tool_approval"
+                if interaction["request"]["approval"]["action"] == provider.MCP_APPROVAL
             ]
             if scope is None:
                 assert not interactions, interactions
@@ -490,11 +489,12 @@ async def exercise():
                     context = actual_context
                 assert actual_context == context, record
                 called = any(
-                    tool["call"].get("name") == "test/get_value"
+                    tool["call"].get("name") == provider.MCP_TOOL
                     for tool in record["started_tools"] + record["tools"]
                 )
                 approval_requested = any(
-                    interaction["request"]["approval"]["action"] == "mcp_tool_approval"
+                    interaction["request"]["approval"]["action"]
+                    == provider.MCP_APPROVAL
                     for interaction in record["interactions"]
                 )
                 if called or approval_requested or retry == MCP_FEEDBACK_LIMIT:
@@ -525,7 +525,8 @@ async def exercise():
                 "No successful bcc call was observed; inspect the printed events"
             )
             assert any(
-                interaction["request"]["approval"]["action"] == "command_execution"
+                interaction["request"]["approval"]["action"]
+                == provider.COMMAND_APPROVAL
                 for interaction in first["interactions"]
             ), "No native command approval reached the channel"
             assert first["steered"] and first["accepted_steering"]
@@ -537,7 +538,7 @@ async def exercise():
                 and continued["provider_thread"] == first["provider_thread"]
             )
             rejected = {
-                interaction["request"]["approval"]["details"]["itemId"]
+                provider.approval_call_id(interaction["request"]["approval"])
                 for interaction in continued["interactions"]
                 if interaction["decision"]["decision"] == "rejected"
             }
@@ -604,15 +605,14 @@ async def exercise():
             await inbound("Please remember that I prefer brief replies.")
             first = await finish("initial")
             parent = psutil.Process(process.pid)
-            servers = [
-                child
-                for child in parent.children()
-                if "app-server" in child.cmdline()
-                and child.environ().get("CODEX_HOME") == environment["CODEX_HOME"]
-            ]
-            assert len(servers) == 1
+
+            def sessions():
+                return provider.session_processes(parent, environment)
+
+            servers = await asyncio.to_thread(sessions)
+            assert len(servers) == 1, [child.cmdline() for child in servers]
             server = servers[0]
-            owned = [server, *server.children(recursive=True)]
+            owned = [server, *await asyncio.to_thread(server.children, recursive=True)]
             print(
                 json.dumps(
                     {
@@ -633,16 +633,9 @@ async def exercise():
             await asyncio.to_thread(psutil.wait_procs, owned)
             await inbound("What reply style did I ask for? Please reply to me.")
             recovered = await finish("recovered")
-            assert (
-                recovered["session"] == first["session"]
-                and recovered["provider_thread"] == first["provider_thread"]
-            )
-            current = [
-                child
-                for child in parent.children()
-                if "app-server" in child.cmdline()
-                and child.environ().get("CODEX_HOME") == environment["CODEX_HOME"]
-            ]
+            assert recovered["session"] == first["session"], recovered
+            assert recovered["provider_thread"] == first["provider_thread"], recovered
+            current = await asyncio.to_thread(sessions)
             assert len(current) == 1 and current[0].pid != server.pid
             await inbound("Tell me briefly what you can help me with.")
             await finish("stop-active", stop_at_started=True)
@@ -650,12 +643,14 @@ async def exercise():
         elif scenario == "refresh":
             await inbound("Please remember that I prefer brief replies.")
             first = await finish("initial")
-            (workspace / "AGENTS.md").write_text("Keep replies concise.\n")
-            await asyncio.sleep(1)
-            await inbound("What reply style did I ask for? Please reply to me.")
-            refreshed = await finish("refreshed")
-            assert refreshed["session"] != first["session"]
-            assert refreshed["provider_thread"] != first["provider_thread"]
+            for name in provider.INSTRUCTION_FILES:
+                (workspace / name).write_text("Keep replies concise.\n")
+                await asyncio.sleep(1)
+                await inbound("What reply style did I ask for? Please reply to me.")
+                refreshed = await finish("refreshed-" + name)
+                assert refreshed["session"] != first["session"]
+                assert refreshed["provider_thread"] != first["provider_thread"]
+                first = refreshed
 
         elif scenario == "background":
             assert process is not None
@@ -721,9 +716,8 @@ async def exercise():
 
             initial_id = await inbound(
                 "Please start a local HTTP preview for the current folder. Run "
-                f"`python3 -m http.server {port} --bind 127.0.0.1` as the "
-                "foreground command in a persistent tool terminal, without a "
-                "trailing `&`. Keep that terminal running after this turn. "
+                f"`python3 -m http.server {port} --bind 127.0.0.1` "
+                f"{provider.BACKGROUND} "
                 "Check that the preview responds, then use `bcc message send` "
                 "to send its address to this conversation."
             )

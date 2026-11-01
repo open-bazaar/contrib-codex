@@ -7,23 +7,12 @@ import os
 import sys
 from pathlib import Path
 
+import provider
 import pytest
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "mcp-once",
-        "mcp-session",
-        "mcp-always",
-        "bcc",
-        "full-access",
-        "recovery",
-        "refresh",
-        "background",
-    ],
-)
+@pytest.mark.parametrize("scenario", provider.SCENARIOS)
 async def test_installed_application(
     tmp_path: Path,
     pytestconfig: pytest.Config,
@@ -45,7 +34,16 @@ async def test_installed_application(
         key: value
         for key, value in os.environ.items()
         if not key.startswith(
-            ("BCN_", "BCC_", "CODEX_", "OPENAI_", "MYSCRM_", "APOLLO_")
+            (
+                "BCN_",
+                "BCC_",
+                "CODEX_",
+                "CLAUDE_",
+                "ANTHROPIC_",
+                "OPENAI_",
+                "MYSCRM_",
+                "APOLLO_",
+            )
         )
     } | {
         "BCN_HOME": str(tmp_path / "home"),
@@ -119,9 +117,7 @@ async def test_installed_application(
         "--refresh",
         "--default-index",
         "https://pypi.org/simple",
-        "bazaar-compute-node>=0.3.0rc9,<0.4",
-        "--with",
-        "psutil>=7.0.0",
+        "bazaar-compute-node>=0.3.0rc12,<0.4",
     ]
     for wheel in wheels:
         arguments.extend(["--with", str(wheel)])
@@ -146,6 +142,19 @@ async def test_installed_application(
         str(shared_agent_root),
         scenario,
     )
+    applications = (
+        "lifecycle_application.py",
+        *(("steering_application.py",) if scenario == "bcc" else ()),
+        *provider.applications(scenario),
+    )
+    for application in applications:
+        await execute(
+            application.removesuffix("_application.py"),
+            str(python),
+            str(source / "tests" / application),
+            str(root),
+            str(shared_agent_root / "workspace"),
+        )
     await execute(
         "bcc",
         str(python),

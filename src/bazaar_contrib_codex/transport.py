@@ -422,6 +422,12 @@ class AppServer:
     async def aclose(self, *, timeout: float):
         await asyncio.shield(self.close(timeout=timeout))
 
+    def _descendants(self) -> list[psutil.Process]:
+        try:
+            return psutil.Process(self.process.pid).children(recursive=True)
+        except psutil.NoSuchProcess:
+            return []
+
     async def _close(self, *, timeout: float):
         loop = asyncio.get_running_loop()
         started_ms = self.timer.now_ms if self.timer is not None else loop.time() * 1000
@@ -429,22 +435,22 @@ class AppServer:
         tasks = tuple(self.requests.values()) + (self.reader, self.errors, self.watcher)
         children: list[psutil.Process] = []
         try:
+            for task in self.requests.values():
+                task.cancel()
+            self.requests.clear()
+            # Neither cancellation nor a spent budget may end the root before
+            # its descendants are captured.
+            capture = asyncio.create_task(asyncio.to_thread(self._descendants))
+            try:
+                children = await asyncio.shield(capture)
+            except asyncio.CancelledError:
+                children = await capture
+                raise
             async with (
                 timer_timeout(self.timer, ceil(deadline_ms - self.timer.now_ms))
                 if self.timer is not None
                 else asyncio.timeout_at(deadline_ms / 1000)
             ):
-                for task in self.requests.values():
-                    task.cancel()
-                self.requests.clear()
-                try:
-                    children = await asyncio.to_thread(
-                        lambda: psutil.Process(self.process.pid).children(
-                            recursive=True
-                        )
-                    )
-                except psutil.NoSuchProcess:
-                    pass
                 if self.process.stdin is not None:
                     self.process.stdin.close()
                 for fraction, operation in (
