@@ -508,6 +508,15 @@ HarnessOutput。MCP 目标以中立 ToolCallCompleted／ToolCallFailed 为观测
 
 ## 任务与记录
 
+### 表单文字（2026-11-07）
+
+BCN 第 13 阶段的 server-agent 按实体配置模型的 schema 统一画运行时表单。依据消息
+`25fe9d74-6015-5615-b26a-1021b11d8792` 与 `7ce989b2-cd0f-577c-9648-97f4153dc2c5`，表单文字放在
+`resources/locales/en.toml` 与 `zh-CN.toml`，键以字段名开头：`<字段>.title`、`<字段>.description`
+与 `<字段>.empty`；`Config` 在 schema 顶层以 `x-locales` 给出两份文字。`api_key` 标 `writeOnly`，
+`model` 标 `x-inspect: "models"`，`effort` 标 `x-inspect: "efforts"`。非 e2e 测试检查每个字段
+在两种语言中都有名称、说明与留空的含义。
+
 ### 终态恢复状态收尾（2026-10-25）
 
 [review 4369079720](https://github.com/open-bazaar/contrib-codex/pull/2#discussion_r4369079720)
