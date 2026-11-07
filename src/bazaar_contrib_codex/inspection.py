@@ -7,7 +7,13 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from bazaar_contrib_harness import HarnessInspection, HarnessModel, HarnessSkill
+from bazaar_contrib_harness import (
+    HarnessInspection,
+    HarnessMcpServer,
+    HarnessMcpTool,
+    HarnessModel,
+    HarnessSkill,
+)
 
 from .approval import decline
 from .transport import AppServer, AppServerError, Packet, background
@@ -44,6 +50,7 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
     server: AppServer | None = None
     models: list[HarnessModel] = []
     skills: tuple[HarnessSkill, ...] = ()
+    servers: list[HarnessMcpServer] = []
 
     async def answer(packet: Packet) -> dict[str, Any]:
         logger.warning("No session owns Codex inspection request %s", packet.id)
@@ -95,11 +102,34 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
             for skill in entry["skills"]
             if skill.get("enabled", True)
         )
+        # the MCP servers Codex sees, each with its sign-in and its tools
+        cursor = None
+        while True:
+            page = await server.request("mcpServerStatus/list", {"cursor": cursor})
+            servers.extend(
+                HarnessMcpServer(
+                    name=item["name"],
+                    auth_status=item["authStatus"],
+                    tools=tuple(
+                        HarnessMcpTool(
+                            name=tool["name"],
+                            description=tool.get("description"),
+                            input_schema=tool["inputSchema"],
+                        )
+                        for tool in item["tools"].values()
+                    ),
+                )
+                for item in page["data"]
+            )
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                break
         return HarnessInspection(
             available=True,
             version=version,
             models=tuple(models),
             skills=skills,
+            mcp_servers=tuple(servers),
             error="\n".join(
                 error["message"]
                 for entry in result["data"]
@@ -113,6 +143,7 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
             version=version,
             models=tuple(models),
             skills=skills,
+            mcp_servers=tuple(servers),
             error=str(error) or type(error).__name__,
         )
     finally:
