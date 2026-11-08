@@ -7,12 +7,48 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from bazaar_contrib_harness import HarnessInspection, HarnessModel, HarnessSkill
+from bazaar_contrib_harness import (
+    HarnessInspection,
+    HarnessMcpServer,
+    HarnessMcpTool,
+    HarnessModel,
+    HarnessSkill,
+    McpAuth,
+    McpConnection,
+    McpFailed,
+)
 
 from .approval import decline
 from .transport import AppServer, AppServerError, Packet, background
 
 logger = logging.getLogger(__name__)
+
+# Codex's sign-in states as the common ones; one it does not know says nothing
+_AUTH = {
+    "unsupported": McpAuth.NONE,
+    "notLoggedIn": McpAuth.SIGNED_OUT,
+    "bearerToken": McpAuth.SIGNED_IN,
+    "oAuth": McpAuth.SIGNED_IN,
+}
+# its connection states, which it gives only within a thread
+_CONNECTION = {
+    "connected": McpConnection.CONNECTED,
+    "starting": McpConnection.CONNECTING,
+    "notStarted": McpConnection.CONNECTING,
+    "disabled": McpConnection.DISABLED,
+}
+
+
+def _connection(item: dict[str, Any]) -> McpConnection | McpFailed | None:
+    """How Codex's link to an MCP server stands: failed when it could not
+    list the server's tools or its connection failed, else as its status
+    says, when it says."""
+    if item.get("toolsError"):
+        return McpFailed(reason=str(item["toolsError"]))
+    status = item.get("runtimeStatus")
+    if status in ("failed", "cancelled"):
+        return McpFailed(reason=status)
+    return _CONNECTION.get(status) if status else None
 
 
 async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # noqa: ASYNC109
@@ -44,6 +80,7 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
     server: AppServer | None = None
     models: list[HarnessModel] = []
     skills: tuple[HarnessSkill, ...] = ()
+    servers: list[HarnessMcpServer] = []
 
     async def answer(packet: Packet) -> dict[str, Any]:
         logger.warning("No session owns Codex inspection request %s", packet.id)
@@ -95,11 +132,35 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
             for skill in entry["skills"]
             if skill.get("enabled", True)
         )
+        # the MCP servers Codex sees, each with its sign-in and its tools
+        cursor = None
+        while True:
+            page = await server.request("mcpServerStatus/list", {"cursor": cursor})
+            servers.extend(
+                HarnessMcpServer(
+                    name=item["name"],
+                    connection=_connection(item),
+                    auth=_AUTH.get(item["authStatus"]),
+                    tools=tuple(
+                        HarnessMcpTool(
+                            name=tool["name"],
+                            description=tool.get("description"),
+                            input_schema=tool["inputSchema"],
+                        )
+                        for tool in item["tools"].values()
+                    ),
+                )
+                for item in page["data"]
+            )
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                break
         return HarnessInspection(
             available=True,
             version=version,
             models=tuple(models),
             skills=skills,
+            mcp_servers=tuple(servers),
             error="\n".join(
                 error["message"]
                 for entry in result["data"]
@@ -113,6 +174,7 @@ async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # n
             version=version,
             models=tuple(models),
             skills=skills,
+            mcp_servers=tuple(servers),
             error=str(error) or type(error).__name__,
         )
     finally:
