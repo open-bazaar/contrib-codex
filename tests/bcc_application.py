@@ -653,7 +653,8 @@ async def exercise():
                 (workspace / name).write_text("Keep replies concise.\n")
                 await asyncio.sleep(1)
                 await inbound("What reply style did I ask for? Please reply to me.")
-                refreshed = await finish("refreshed-" + name)
+                # the turn's session shows the refresh, whatever the model says
+                refreshed = await finish("refreshed-" + name, stop_at_started=True)
                 assert refreshed["session"] != first["session"]
                 assert refreshed["provider_thread"] != first["provider_thread"]
                 first = refreshed
