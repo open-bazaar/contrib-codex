@@ -7,6 +7,7 @@ from typing import Any
 
 import psutil
 import tomli_w
+from bazaar_contrib_harness import CommandDetail, ToolCallCompleted, ToolCallFailed
 from bazaar_core import ContribEntry
 
 from bazaar_contrib_codex import harness
@@ -85,11 +86,27 @@ def applications(scenario: str) -> tuple[str, ...]:
 
 
 def bcc_command(call: dict[str, Any]) -> str | None:
-    return call["input"] if isinstance(call["input"], str) else None
+    return call["detail"]["command"] if call["detail"]["kind"] == "command" else None
 
 
-def mcp_output(call: dict[str, Any]) -> Any:
-    return call["output"]["structuredContent"]
+def session_model(direction: str, packet: dict[str, Any]) -> str | None:
+    """The model a thread/start or thread/resume answer names."""
+    result = packet.get("result")
+    if direction == "received" and isinstance(result, dict) and "thread" in result:
+        return result.get("model")
+    return None
+
+
+def verify_call(payload: ToolCallCompleted | ToolCallFailed) -> None:
+    """A command gives its text, working directory and duration, and exits
+    with zero exactly when it completes."""
+    detail = payload.call.detail
+    if isinstance(detail, CommandDetail):
+        assert detail.command and detail.cwd, payload
+        assert payload.call.duration_ms is not None, payload
+        assert (detail.exit_code == 0) == isinstance(payload, ToolCallCompleted), (
+            payload
+        )
 
 
 def approval_call_id(approval: dict[str, Any]) -> str:
