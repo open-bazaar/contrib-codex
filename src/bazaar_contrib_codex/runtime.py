@@ -9,16 +9,22 @@ import asyncio
 import logging
 from math import ceil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from bazaar_contrib_audit import Audit, AuditContext
 from bazaar_contrib_harness import (
+    AgentDetail,
     ApprovalHandler,
+    ChangeDetail,
+    ChangedFile,
+    CommandAction,
+    CommandDetail,
     ContentDelta,
     ContentDeltaKind,
     ContextCompactionCompleted,
     ContextCompactionStarted,
     FileChangeEntry,
+    FileDetail,
     HarnessEventPayload,
     HarnessExpire,
     HarnessFailure,
@@ -29,6 +35,9 @@ from bazaar_contrib_harness import (
     HarnessSessionReconciliation,
     HarnessSessionUnavailable,
     HarnessTurn,
+    McpDetail,
+    ModelUpdated,
+    OtherDetail,
     ProviderCallResult,
     ProviderCallStatus,
     SandboxPolicy,
@@ -46,10 +55,11 @@ from bazaar_contrib_harness import (
     TurnFailed,
     TurnStarted,
     UsageUpdated,
+    WebDetail,
 )
 from bazaar_contrib_timer import Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 
 from .approval import decline, interact
 from .source import SourceAudit
@@ -76,7 +86,12 @@ _TOOL_TYPE_NAMES = {
     "functionCallOutput": "function",
 }
 
-_JSON_VALUE_ADAPTER = TypeAdapter[JsonValue](JsonValue)
+_COMMAND_ACTIONS: dict[str, Literal["read", "list", "search", "other"]] = {
+    "read": "read",
+    "listFiles": "list",
+    "search": "search",
+    "unknown": "other",
+}
 
 
 class FsWatchResponse(BaseModel):
@@ -120,14 +135,17 @@ class TurnStream:
         turn: HarnessTurn,
         approval: ApprovalHandler,
         timeout: float,
+        model: str | None = None,
     ):
         self.connection = connection
         self.turn = turn
         self.approval = approval
         self.timeout = timeout
+        self.model = model
         self.provider_turn_id: str | None = None
         self.finished = False
         self.initial_error: Exception | None = None
+        self.started_at: dict[str, int] = {}
 
     def __aiter__(self) -> TurnStream:
         return self
@@ -166,6 +184,17 @@ class TurnStream:
                     provider="codex",
                     provider_event="turn/start",
                     provider_session_id=self.connection.session.provider_thread_id,
+                )
+            if self.model is not None:
+                model, self.model = self.model, None
+                return HarnessOutput(
+                    session_id=self.turn.session_id,
+                    turn_id=self.turn.id,
+                    payload=ModelUpdated(model=model),
+                    provider="codex",
+                    provider_event="turn/start",
+                    provider_session_id=self.connection.session.provider_thread_id,
+                    provider_turn_id=self.provider_turn_id,
                 )
             while True:
                 packet = await self.connection.server.events.get()
@@ -288,31 +317,99 @@ class TurnStream:
                             parts = item["command"].strip().split(maxsplit=1)
                             name = parts[0] if parts else None
                         name = name or _TOOL_TYPE_NAMES.get(item["type"], "tool")
-                        started = packet.method == "item/started"
-                        fields = (
-                            ("arguments", "input", "command")
-                            if started
-                            else ("result", "output", "contentItems")
-                        )
-                        field = next((field for field in fields if field in item), None)
-                        try:
-                            value = (
-                                None
-                                if field is None
-                                else _JSON_VALUE_ADAPTER.validate_python(
-                                    item[field], strict=True
+                        match item:
+                            case {"type": "commandExecution"}:
+                                detail = CommandDetail(
+                                    command=item["command"],
+                                    cwd=item["cwd"],
+                                    exit_code=item["exitCode"],
+                                    output=item["aggregatedOutput"],
+                                    actions=tuple(
+                                        CommandAction(
+                                            kind=_COMMAND_ACTIONS[action["type"]],
+                                            command=action["command"],
+                                            path=action.get("path"),
+                                            query=action.get("query"),
+                                        )
+                                        for action in item["commandActions"]
+                                    ),
                                 )
-                            )
-                        except ValidationError as error:
-                            raise AppServerError(
-                                f"item lifecycle {field} must be a JSON value",
-                                reason=HarnessFailureReason.PROTOCOL,
-                            ) from error
+                            case {"type": "mcpToolCall"}:
+                                detail = McpDetail(
+                                    server=item["server"],
+                                    tool=item["tool"],
+                                    arguments=item["arguments"],
+                                    result=None
+                                    if item["result"] is None
+                                    else "\n".join(
+                                        block["text"]
+                                        for block in item["result"]["content"]
+                                        if block["type"] == "text"
+                                    )
+                                    or None,
+                                )
+                            case {"type": "fileChange"}:
+                                detail = ChangeDetail(
+                                    changes=tuple(
+                                        ChangedFile(
+                                            path=change["path"],
+                                            kind=change["kind"]["type"],
+                                        )
+                                        for change in item["changes"]
+                                    )
+                                )
+                            case {
+                                "type": "webSearch",
+                                "action": {"type": "search", "query": query},
+                            }:
+                                detail = WebDetail(action="search", query=query)
+                            case {
+                                "type": "webSearch",
+                                "action": {"type": "openPage", "url": url},
+                            }:
+                                detail = WebDetail(action="open", url=url)
+                            case {
+                                "type": "webSearch",
+                                "action": {
+                                    "type": "findInPage",
+                                    "url": url,
+                                    "pattern": pattern,
+                                },
+                            }:
+                                detail = WebDetail(
+                                    action="find", url=url, query=pattern
+                                )
+                            case {"type": "webSearch"}:
+                                detail = WebDetail(
+                                    action="search", query=item["query"] or None
+                                )
+                            case {"type": "imageView"}:
+                                detail = FileDetail(action="read", path=item["path"])
+                            case {"type": "collabAgentToolCall"}:
+                                detail = AgentDetail(description=item["prompt"])
+                            case _:
+                                detail = OtherDetail(
+                                    name=name,
+                                    input=item.get("arguments"),
+                                    output=item.get(
+                                        "result",
+                                        item.get("output", item.get("contentItems")),
+                                    ),
+                                )
+                        started = packet.method == "item/started"
+                        if started:
+                            self.started_at[item["id"]] = params["startedAtMs"]
+                            duration_ms = None
+                        else:
+                            started_at = self.started_at.pop(item["id"], None)
+                            duration_ms = item.get("durationMs")
+                            if duration_ms is None and started_at is not None:
+                                duration_ms = params["completedAtMs"] - started_at
                         call = ToolCall(
                             call_id=item["id"],
                             name=name,
-                            input=value if started else None,
-                            output=None if started else value,
+                            duration_ms=duration_ms,
+                            detail=detail,
                         )
                         error = item.get("error")
                         if started:
@@ -397,6 +494,10 @@ class TurnStream:
                                 model_context_window=usage.get("modelContextWindow"),
                             ),
                             packet,
+                        )
+                    case "model/rerouted":
+                        return self.output(
+                            ModelUpdated(model=params["toModel"]), packet
                         )
                     case "error":
                         if not isinstance(params["willRetry"], bool):
@@ -485,6 +586,7 @@ class TurnStream:
 
 class Connection:
     server: AppServer
+    model: str
 
     def __init__(self, owner: CodexHarness, request: SessionInput):
         self.owner = owner
@@ -658,6 +760,7 @@ class CodexHarness:
                 connection.session = HarnessSession(
                     id=request.id, provider_thread_id=result["thread"]["id"]
                 )
+                connection.model = result["model"]
             self.connections[request.id] = connection
             return ProviderCallResult(
                 status=ProviderCallStatus.CONFIRMED, value=connection.session
@@ -696,7 +799,9 @@ class CodexHarness:
             raise HarnessSessionUnavailable("The session's Codex app-server has exited")
         if connection.stream is not None and not connection.stream.finished:
             raise RuntimeError("The Codex session already owns an active turn")
-        stream = TurnStream(connection, turn, approval_handler, timeout)
+        stream = TurnStream(
+            connection, turn, approval_handler, timeout, self.model or connection.model
+        )
         connection.stream = stream
         connection.source.turn_id = turn.id
         self.turns.pop(session.id, None)
@@ -905,6 +1010,7 @@ class CodexHarness:
                             "Codex resumed a different provider thread",
                             reason=HarnessFailureReason.STATE_MISMATCH,
                         )
+                    connection.model = response["model"]
                     if previous is not None:
                         previous.finished = True
                     connection.stream = None
