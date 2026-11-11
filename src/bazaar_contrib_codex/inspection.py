@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,7 @@ from bazaar_contrib_harness import (
 )
 
 from .approval import decline
-from .transport import AppServer, AppServerError, Packet, background
+from .transport import AppServer, AppServerError, Packet, background, executable
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def _connection(item: dict[str, Any]) -> McpConnection | McpFailed | None:
 async def inspect(workspace: Path, *, timeout: float) -> HarnessInspection:  # noqa: ASYNC109
     try:
         process = await asyncio.create_subprocess_exec(
-            "codex",
+            await executable(dict(os.environ)),
             "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

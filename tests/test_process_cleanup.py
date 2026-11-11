@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -103,9 +104,18 @@ async def test_stop_cleans_descendants(
 
     create_process = asyncio.create_subprocess_exec
     source = script(descendant)
+    # codex as npm installs it: on Windows a codex.cmd shim, found on the path
+    # as 0.2 found it rather than started by its bare name
+    shims = tmp_path / "bin"
+    shim = shims / ("codex.cmd" if sys.platform == "win32" else "codex")
+    await asyncio.to_thread(shims.mkdir)
+    await asyncio.to_thread(shim.write_text, "")
+    await asyncio.to_thread(shim.chmod, 0o755)
+    monkeypatch.setenv("PATH", f"{shims}{os.pathsep}{os.environ['PATH']}")
 
     async def start_process(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
-        assert args == ("codex", "app-server", "--listen", "stdio://")
+        assert os.path.normcase(args[0]) == os.path.normcase(shim)
+        assert args[1:] == ("app-server", "--listen", "stdio://")
         # Replace only the executable; keep the production spawn and ownership path.
         return await create_process(sys.executable, "-c", source, **kwargs)
 

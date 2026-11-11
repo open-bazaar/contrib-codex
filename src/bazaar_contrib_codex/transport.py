@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -72,6 +73,16 @@ class Packet(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     result: Any = None
     error: Any = None
+
+
+async def executable(environment: dict[str, str]) -> str:
+    """Where codex is on the path the process gets, as 0.2 found it: a
+    command installed as a shim, such as npm's codex.cmd on Windows, is not
+    started by its bare name."""
+    found = await asyncio.to_thread(shutil.which, "codex", path=environment.get("PATH"))
+    if found is None:
+        raise FileNotFoundError("Codex executable not found: codex")
+    return found
 
 
 class AppServerError(RuntimeError):
@@ -168,13 +179,14 @@ class AppServer:
         timer: Timer | None = None,
         source: SourceAudit | None = None,
     ) -> AppServer:
+        environment = os.environ | environment
         process = await asyncio.create_subprocess_exec(
-            "codex",
+            await executable(environment),
             "app-server",
             "--listen",
             "stdio://",
             cwd=workspace,
-            env=os.environ | environment,
+            env=environment,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
