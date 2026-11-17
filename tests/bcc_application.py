@@ -71,6 +71,9 @@ async def exercise():
     workspace = arguments.workspace.resolve()
     background = None
     preview_processes = {}
+    startup_failures = []
+    stderr = []
+    sqlite = root / "sqlite-startup"
     if scenario == "background":
         config = root / "node.toml"
         document = tomllib.loads(config.read_text())
@@ -107,6 +110,15 @@ async def exercise():
         async for packet in packets(reader):
             if "audit" in packet:
                 print(json.dumps({"phase": phase, **packet}), flush=True)
+                if packet["audit"]["event_name"] == "harness.source.stderr":
+                    stderr.append(packet["audit"]["payload"]["data"])
+                if (
+                    scenario == "startup-recovery"
+                    and packet["audit"]["event_name"] == "harness.session.failed"
+                ):
+                    if not startup_failures:
+                        await asyncio.to_thread(sqlite.unlink)
+                    startup_failures.append(packet["audit"]["payload"]["failure"])
             await queue.put(packet)
         await queue.put(None)
 
@@ -139,12 +151,13 @@ async def exercise():
         inspection = cast(dict[str, Any], found[-1])
         assert inspection["available"] and inspection["version"], inspection
         assert inspection["models"] and not inspection["error"], inspection
-        # the MCP server Codex is given, with the tool it offers
-        assert any(
-            server["name"] == "test"
-            and any(tool["name"] == "get_value" for tool in server["tools"])
-            for server in inspection["mcp_servers"]
-        ), inspection
+        if scenario != "startup-recovery":
+            # the MCP server Codex is given, with the tool it offers
+            assert any(
+                server["name"] == "test"
+                and any(tool["name"] == "get_value" for tool in server["tools"])
+                for server in inspection["mcp_servers"]
+            ), inspection
         reader, writer = await asyncio.open_connection(
             "127.0.0.1", json.loads(endpoint.read_text())["port"]
         )
@@ -231,7 +244,9 @@ async def exercise():
         assert sources and set(sources) == set(closed)
         # every turn that got to work names the model its session's runtime
         # answered with; one stopped as it starts may not have been told yet
-        assert turns and all(
+        if scenario != "startup-recovery":
+            assert turns
+        assert all(
             reported.get(turn) and reported[turn] <= answered.get(session, set())
             for session, turn in turns
         ), (turns, reported, answered)
@@ -242,7 +257,11 @@ async def exercise():
                 range(1, closed[source_id]["sequence"] + 1)
             )
             directions = {event.direction for event in messages}
-            assert directions == {"sent", "received"}
+            if closed[source_id]["returncode"] == 0:
+                assert directions == {"sent", "received"}
+            else:
+                assert scenario == "startup-recovery"
+                assert "sent" in directions
             assert all(
                 previous.monotonic_ns <= current.monotonic_ns
                 for previous, current in pairwise(messages)
@@ -555,7 +574,30 @@ async def exercise():
                 phase = f"{label}-retry-{retry}"
                 input_message_id = await inbound(feedback)
 
-        if scenario == "mcp-once":
+        if scenario == "startup-recovery":
+            # Make the real CLI's state directory unavailable for its first start.
+            sqlite.write_text("This path is a file, not a SQLite state directory.\n")
+            config = Path(environment[provider.HOME]) / "config.toml"
+            document = tomllib.loads(config.read_text())
+            document["sqlite_home"] = str(sqlite / "state")
+            config.write_text(tomli_w.dumps(document))
+            input_message_id = await inbound("你好，先跟我打个招呼吧。")
+            first = await finish(
+                "startup-recovery",
+                stop_at_started=True,
+                input_message_id=input_message_id,
+            )
+            assert startup_failures, "The real CLI did not exercise startup failure"
+            assert all(
+                "sqlite" in failure["message"].lower()
+                and failure["reason"] == "connection_lost"
+                and failure["code"] == 1
+                and not failure["needs_reconciliation"]
+                for failure in startup_failures
+            ), startup_failures
+            assert "sqlite" in "".join(stderr).lower(), stderr
+            assert first["provider_thread"] and first["provider_turn"], first
+        elif scenario == "mcp-once":
             first = await query_value(
                 "mcp-once",
                 "once",

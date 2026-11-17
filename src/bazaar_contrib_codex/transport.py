@@ -416,14 +416,20 @@ class AppServer:
         while chunk := await stderr.read(64 * 1024):
             buffer.extend(chunk)
             while (index := buffer.find(b"\n")) >= 0:
-                line = bytes(buffer[:index]).decode(errors="replace").rstrip("\r")
+                data = bytes(buffer[: index + 1]).decode(errors="replace")
                 del buffer[: index + 1]
+                line = data.rstrip("\r\n")
                 self.stderr_tail.append(line)
                 logger.debug("Codex app-server stderr: %s", line)
+                if self.source is not None:
+                    await self.source.stderr(data)
         if buffer:
-            line = buffer.decode(errors="replace").rstrip("\r")
+            data = buffer.decode(errors="replace")
+            line = data.rstrip("\r")
             self.stderr_tail.append(line)
             logger.debug("Codex app-server stderr: %s", line)
+            if self.source is not None:
+                await self.source.stderr(data)
 
     def close(self, *, timeout: float) -> asyncio.Task[None]:
         if self.closing is None:

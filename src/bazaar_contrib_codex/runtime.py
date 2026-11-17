@@ -776,9 +776,7 @@ class CodexHarness:
                 status=ProviderCallStatus.FAILED,
                 failure=failure(
                     error,
-                    needs_reconciliation=isinstance(
-                        error, (AppServerUnavailable, TimeoutError)
-                    ),
+                    needs_reconciliation=False,
                 ),
             )
 

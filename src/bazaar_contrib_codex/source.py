@@ -23,6 +23,13 @@ class SourceAudit:
         self.turns: dict[str, str] = {}
         self.requests: dict[tuple[str, int | str], AuditContext] = {}
 
+    async def stderr(self, data: str) -> None:
+        await self.audit.publish(
+            "harness.source.stderr",
+            context=self.context.model_copy(update={"turn_id": self.turn_id}),
+            payload={"provider": "codex", "source_id": self.id, "data": data},
+        )
+
     async def publish(
         self,
         data: str,
