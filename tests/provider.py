@@ -28,6 +28,7 @@ SCENARIOS = (
     "recovery",
     "refresh",
     "background",
+    "startup-recovery",
 )
 FULL_ACCESS = frozenset({"full-access"})
 INSTRUCTION_FILES = ("AGENTS.md",)
@@ -51,6 +52,9 @@ def configure(
     model: str,
     scenario: str,
 ) -> None:
+    if scenario == "startup-recovery":
+        (home / "config.toml").write_text(tomli_w.dumps({"model": model}))
+        return
     codex = {
         "model": model,
         "model_context_window": 131072,
