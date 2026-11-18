@@ -9,6 +9,7 @@ import asyncio
 import logging
 from math import ceil
 from pathlib import Path
+from time import time_ns
 from typing import Any, Literal
 
 from bazaar_contrib_audit import Audit, AuditContext
@@ -59,7 +60,8 @@ from bazaar_contrib_harness import (
 )
 from bazaar_contrib_timer import Timer
 from bazaar_contrib_timer import timeout as timer_timeout
-from pydantic import BaseModel, JsonValue, ValidationError
+from pydantic import BaseModel, Field, JsonValue, ValidationError
+lazy from bazaar_contrib_harness import QuotaSnapshot, QuotaWindow
 
 from .approval import decline, interact
 from .source import SourceAudit
@@ -100,6 +102,26 @@ class FsWatchResponse(BaseModel):
 
 class BackgroundTerminalsResponse(BaseModel):
     data: list[dict[str, Any]]
+
+
+class RateLimitWindow(BaseModel):
+    used_pct: int = Field(alias="usedPercent")
+    duration_minutes: int | None = Field(default=None, alias="windowDurationMins")
+    resets_at: int | None = Field(default=None, alias="resetsAt")
+
+
+class RateLimitBucket(BaseModel):
+    name: str | None = Field(default=None, alias="limitName")
+    model: str | None = Field(default=None, alias="normalModelSlug")
+    primary: RateLimitWindow | None = None
+    secondary: RateLimitWindow | None = None
+
+
+class AccountRateLimits(BaseModel):
+    primary: RateLimitBucket = Field(alias="rateLimits")
+    buckets: dict[str, RateLimitBucket] | None = Field(
+        default=None, alias="rateLimitsByLimitId"
+    )
 
 
 def turn_failure(
@@ -732,6 +754,51 @@ class CodexHarness:
 
     async def receive_event(self) -> HarnessExpire:
         return await self.events.get()
+
+    async def read_quota(self) -> QuotaSnapshot | None:
+        async def answer(packet: Packet) -> dict[str, Any]:
+            return decline(packet)
+
+        environment = {} if self.api_key is None else {"OPENAI_API_KEY": self.api_key}
+        try:
+            server = await AppServer.start(
+                self.input.workspace,
+                environment,
+                answer,
+                lambda _: None,
+                timeout=self.input.startup_timeout,
+                timer=self.timer,
+            )
+            try:
+                await server.initialize()
+                limits = AccountRateLimits.model_validate(
+                    await server.request("account/rateLimits/read", {})
+                )
+                observed_at_ms = time_ns() // 1_000_000
+            finally:
+                await server.aclose(timeout=self.input.shutdown_timeout)
+        except OSError, AppServerError, ValidationError:
+            return None
+
+        buckets = limits.buckets.values() if limits.buckets else (limits.primary,)
+        windows = tuple(
+            QuotaWindow(
+                name=bucket.name or bucket.model,
+                duration_minutes=window.duration_minutes,
+                remaining_pct=max(0, 100 - window.used_pct),
+                resets_at_ms=None
+                if window.resets_at is None
+                else window.resets_at * 1000,
+            )
+            for bucket in buckets
+            for window in (bucket.primary, bucket.secondary)
+            if window is not None
+        )
+        return (
+            QuotaSnapshot(observed_at_ms=observed_at_ms, windows=windows)
+            if windows
+            else None
+        )
 
     async def start_session(
         self,
